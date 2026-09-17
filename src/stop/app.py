@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import os
+import time
+import traceback
 from pathlib import Path
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
-from textual.widgets import Footer, Header, Static
+from textual.screen import ModalScreen
+from textual.widgets import Footer, Header, Input, Static
 
 from .activity import pick_active_now
 from .config import StopConfig, apply_agent_order, load_config
@@ -24,6 +28,67 @@ def _state_style(state: WindowState) -> str:
     if state == WindowState.UNMANAGED:
         return "dim"
     return "green"
+
+
+def _age(epoch: float, now: float | None = None) -> str:
+    if not epoch:
+        return "-"
+    now = now or time.time()
+    sec = max(0, int(now - epoch))
+    if sec < 60:
+        return f"{sec}s"
+    if sec < 3600:
+        return f"{sec // 60}m"
+    return f"{sec // 3600}h"
+
+
+def _plain(text: str) -> str:
+    """Make arbitrary log/UI text safe for Rich markup (escape ALL brackets)."""
+    # rich.markup.escape only escapes tag-shaped [...] ; Broca logs also contain
+    # stray closers like [/path] which raise MarkupError and kill the app.
+    return text.replace("\\", "\\\\").replace("[", "\\[")
+
+
+def _safe_lines(text: str, *, limit: int = 40, width: int = 120) -> list[str]:
+    """Plain log lines safe for Rich markup rendering."""
+    out = []
+    for pl in (text or "").strip().splitlines()[-limit:]:
+        cleaned = "".join(ch if ch >= " " or ch in "\t" else "?" for ch in pl)
+        out.append(_plain(cleaned[:width]))
+    return out
+
+
+class HelpScreen(ModalScreen[None]):
+    """Full help overlay (PRD `?`)."""
+
+    BINDINGS = [Binding("escape", "dismiss_help", "close", show=False), Binding("q", "dismiss_help", "close", show=False), Binding("question_mark", "dismiss_help", "close", show=False)]
+
+    def compose(self) -> ComposeResult:
+        yield Static(
+            "[b]stop — SanctumOS-top[/b]\n\n"
+            "↑↓ / j k     select agent\n"
+            "Enter        expand window full-height\n"
+            "Esc          collapse / close help / cancel filter\n"
+            "Tab          cycle panes (narrow: page agents→windows→Active Now)\n"
+            "a            jump to Active Now\n"
+            "f            follow-lock / release Active Now\n"
+            "/            filter agents\n"
+            "?            this help\n"
+            "q            quit\n\n"
+            "No restart button — cron restarts agents.\n"
+            "Letta + stop screens excluded from Active Now.\n"
+            "Log lines with [brackets] are escaped (cannot crash UI).\n\n"
+            "[dim]Esc / q / ? to close[/dim]",
+            id="help-body",
+        )
+
+    def action_dismiss_help(self) -> None:
+        self.dismiss()
+
+    def on_key(self, event) -> None:  # noqa: ANN001
+        # Any key closes so Mark isn't trapped.
+        if event.key not in ("up", "down", "left", "right"):
+            self.dismiss()
 
 
 class HostStrip(Static):
@@ -72,15 +137,19 @@ class AgentList(Static):
         self.refresh_view()
 
     def refresh_view(self) -> None:
+        now = time.time()
         lines = []
         for i, a in enumerate(self.visible()):
             mark = ">" if i == self.index else " "
             style = _state_style(a.state)
             badge = badge_label(a.state)
-            lines.append(f"{mark} [{style}]{a.name:<12}[/{style}] {badge}")
+            age = _age(a.last_activity_epoch, now)
+            lines.append(
+                f"{mark} [{style}]{_plain(a.name):<10}[/{style}] {badge:<9} {age}"
+            )
         title = "agents"
         if self.filter:
-            title += f" /{self.filter}"
+            title += f" /{_plain(self.filter)}"
         body = "\n".join(lines) if lines else "(none)"
         self.update(f"[b]{title}[/b]\n{body}")
 
@@ -99,26 +168,41 @@ class WindowPane(Static):
             w = agent.windows[win_index % len(agent.windows)]
             style = _state_style(w.state)
             lines = [
-                f"[b]{agent.name} / {w.label}[/b] [{style}]{badge_label(w.state)}[/{style}]  (Esc to collapse)"
+                f"[b]{_plain(agent.name)} / {_plain(w.label)}[/b] "
+                f"[{style}]{badge_label(w.state)}[/{style}]  (Esc to collapse)"
             ]
             if is_failure(w.state):
-                lines.append("[red]waiting for supervisor…[/red]")
-            preview = (w.last_scrollback or "").strip().splitlines()
-            lines.extend(pl[:140] for pl in preview[-40:])
+                miss = f" — missing {int(w.seconds_missing)}s" if w.seconds_missing else ""
+                lines.append(f"[red]waiting for supervisor…{miss}[/red]")
+            if w.bridge_inbox_count is not None:
+                lines.append(
+                    f"otto bridge  inbox={w.bridge_inbox_count}  "
+                    f"outbox={w.bridge_outbox_count or 0}"
+                )
+            lines.extend(_safe_lines(w.last_scrollback, limit=40, width=140))
             self.update("\n".join(lines) if lines else "(empty)")
             return
-        lines = [f"[b]{agent.name} windows[/b]"]
+        lines = [f"[b]{_plain(agent.name)} windows[/b]"]
         for i, w in enumerate(agent.windows):
             mark = ">" if i == win_index else " "
             style = _state_style(w.state)
             badge = badge_label(w.state)
             pid = f" pid={w.last_seen_pid}" if w.last_seen_pid else ""
-            lines.append(f"{mark} [{style}]{w.label}[/{style}] {badge}{pid}")
-            preview = (w.last_scrollback or "").strip().splitlines()
+            miss = ""
+            if is_failure(w.state) and w.seconds_missing:
+                miss = f" {int(w.seconds_missing)}s"
+            lines.append(
+                f"{mark} [{style}]{_plain(w.label)}[/{style}] {badge}{miss}{pid}"
+            )
             if is_failure(w.state):
                 lines.append("    [red]waiting for supervisor…[/red]")
-            for pl in preview[-3:]:
-                lines.append(f"    {pl[:100]}")
+            if w.bridge_inbox_count is not None:
+                lines.append(
+                    f"    otto bridge  inbox={w.bridge_inbox_count}  "
+                    f"outbox={w.bridge_outbox_count or 0}"
+                )
+            for pl in _safe_lines(w.last_scrollback, limit=4, width=100):
+                lines.append(f"    {pl}")
         self.update("\n".join(lines))
 
 
@@ -131,14 +215,13 @@ class ActiveNowPane(Static):
             self.update(f"[b]Active Now[/b]{lock}\n(idle)")
             return
         style = _state_style(window.state)
+        age = _age(window.last_activity_epoch)
         lines = [
-            f"[b]Active Now[/b]{lock} — [{style}]{window.label}[/{style}] {badge_label(window.state)}"
+            f"[b]Active Now[/b]{lock} — [{style}]{_plain(window.label)}[/{style}] "
+            f"{badge_label(window.state)}  age {age}"
         ]
-        preview = (window.last_scrollback or "").strip().splitlines()
-        for pl in preview[-10:]:
-            lines.append(pl[:120])
-        if not preview:
-            lines.append("(no scrollback yet)")
+        preview = _safe_lines(window.last_scrollback, limit=12, width=120)
+        lines.extend(preview if preview else ["(no scrollback yet)"])
         self.update("\n".join(lines))
 
 
@@ -147,7 +230,7 @@ class EventStrip(Static):
         if not snap.events:
             self.update("events: (none)")
             return
-        bits = [e.message for e in snap.events[-5:]]
+        bits = [_plain(e.message) for e in snap.events[-5:]]
         self.update("events: " + " · ".join(bits))
 
 
@@ -160,15 +243,25 @@ class StopApp(App[None]):
     #events { height: 1; dock: bottom; color: $text-muted; padding: 0 1; }
     #body { height: 1fr; }
     #row { height: 1fr; }
-    #agents { width: 28; border: solid $accent; padding: 0 1; }
+    #agents { width: 32; border: solid $accent; padding: 0 1; }
     #windows { width: 1fr; border: solid $primary; padding: 0 1; }
-    #active { height: 12; border: solid $warning; padding: 0 1; }
+    #active { height: 14; border: solid $warning; padding: 0 1; }
+    #filter { dock: bottom; display: none; height: 3; }
+    #filter.visible { display: block; }
 
-    /* medium: stack windows above active inside body already; shrink agents */
-    Screen.medium #agents { width: 22; }
+    HelpScreen { align: center middle; background: $background 80%; }
+    #help-body {
+        width: 64;
+        height: auto;
+        max-height: 90%;
+        border: heavy $accent;
+        background: $surface;
+        padding: 1 2;
+    }
+
+    Screen.medium #agents { width: 28; }
     Screen.medium #active { height: 10; }
 
-    /* narrow / Termux: single column — hide non-focused panes via classes */
     Screen.narrow #row { layout: vertical; }
     Screen.narrow #agents { width: 1fr; height: 1fr; }
     Screen.narrow #windows { width: 1fr; height: 1fr; display: none; }
@@ -201,7 +294,10 @@ class StopApp(App[None]):
         self._filter = ""
         self._snap: HostSnapshot | None = None
         self._win_index = 0
-        self._narrow_page = "agents"  # agents | windows | active
+        self._narrow_page = "agents"
+        self._errors = 0
+        if isinstance(self.host, LiveHost):
+            self.host.hardcopy_interval_s = float(self.config.refresh_hardcopy_s)
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -212,10 +308,12 @@ class StopApp(App[None]):
                 yield WindowPane(id="windows")
             yield ActiveNowPane(id="active")
         yield EventStrip(id="events")
+        yield Input(placeholder="filter agents… (Enter apply, Esc cancel)", id="filter")
         yield Footer()
 
     def on_mount(self) -> None:
-        self.set_interval(self.config.refresh_host_s, self.refresh_host)
+        interval = max(1.0, float(self.config.refresh_host_s))
+        self.set_interval(interval, self.refresh_host)
         self.refresh_host()
         self.query_one(AgentList).focus()
         self._apply_breakpoint()
@@ -238,25 +336,62 @@ class StopApp(App[None]):
         elif size.width < 120:
             screen.add_class("medium")
 
+    def _update_focus_screens(self, selected: Agent | None, active: Window | None) -> None:
+        if not isinstance(self.host, LiveHost):
+            return
+        names: set[str] = set()
+        if selected:
+            for w in selected.windows:
+                if w.screen_name:
+                    names.add(w.screen_name)
+        if active and active.screen_name:
+            names.add(active.screen_name)
+        self.host.set_focus_screens(names)
+
     def refresh_host(self) -> None:
-        snap = self.host.snapshot()
-        snap.agents = apply_agent_order(snap.agents, self.config)
-        self._snap = snap
-        self.query_one(HostStrip).show(snap)
-        agents_w = self.query_one(AgentList)
-        agents_w.filter = self._filter
-        agents_w.set_agents(snap.agents)
-        self.query_one(WindowPane).show_agent(agents_w.selected(), self._win_index)
-        exclude = frozenset(self.config.active_exclude)
-        active = pick_active_now(
-            snap.agents,
-            follow_lock_id=self.follow_lock_id,
-            exclude_screens=exclude,
-        )
-        self.query_one(ActiveNowPane).show(
-            active, locked=self.follow_lock_id is not None
-        )
-        self.query_one(EventStrip).show(snap)
+        try:
+            agents_w = self.query_one(AgentList)
+            selected = agents_w.selected() if self._snap else None
+            active_guess = None
+            if self._snap:
+                active_guess = pick_active_now(
+                    self._snap.agents,
+                    follow_lock_id=self.follow_lock_id,
+                    exclude_screens=frozenset(self.config.active_exclude),
+                )
+            self._update_focus_screens(selected, active_guess)
+
+            snap = self.host.snapshot()
+            snap.agents = apply_agent_order(snap.agents, self.config)
+            self._snap = snap
+            self.query_one(HostStrip).show(snap)
+            agents_w.filter = self._filter
+            agents_w.set_agents(snap.agents)
+            selected = agents_w.selected()
+            self.query_one(WindowPane).show_agent(selected, self._win_index)
+            active = pick_active_now(
+                snap.agents,
+                follow_lock_id=self.follow_lock_id,
+                exclude_screens=frozenset(self.config.active_exclude),
+            )
+            self._update_focus_screens(selected, active)
+            self.query_one(ActiveNowPane).show(
+                active, locked=self.follow_lock_id is not None
+            )
+            self.query_one(EventStrip).show(snap)
+            self._errors = 0
+        except Exception as exc:  # noqa: BLE001 — keep TUI alive
+            self._errors += 1
+            self.query_one(EventStrip).update(
+                f"[red]refresh error ({self._errors}): {_plain(str(exc)[:80])}[/red]"
+            )
+            try:
+                log = Path(f"/tmp/stop-{os.getuid()}") / "tui-errors.log"
+                log.parent.mkdir(mode=0o700, exist_ok=True)
+                with log.open("a", encoding="utf-8") as f:
+                    f.write(time.strftime("%Y-%m-%dT%H:%M:%S ") + traceback.format_exc() + "\n")
+            except OSError:
+                pass
 
     def action_down(self) -> None:
         pane = self.query_one(WindowPane)
@@ -269,6 +404,7 @@ class StopApp(App[None]):
         self.query_one(AgentList).move(1)
         self._win_index = 0
         self._sync_windows()
+        self.refresh_host()
 
     def action_up(self) -> None:
         pane = self.query_one(WindowPane)
@@ -281,6 +417,7 @@ class StopApp(App[None]):
         self.query_one(AgentList).move(-1)
         self._win_index = 0
         self._sync_windows()
+        self.refresh_host()
 
     def _sync_windows(self) -> None:
         if self._snap is None:
@@ -289,6 +426,9 @@ class StopApp(App[None]):
         self.query_one(WindowPane).show_agent(agents_w.selected(), self._win_index)
 
     def action_expand(self) -> None:
+        filt = self.query_one("#filter", Input)
+        if "visible" in filt.classes:
+            return
         pane = self.query_one(WindowPane)
         pane.expanded = True
         self._sync_windows()
@@ -297,6 +437,12 @@ class StopApp(App[None]):
             self._apply_breakpoint()
 
     def action_collapse(self) -> None:
+        filt = self.query_one("#filter", Input)
+        if "visible" in filt.classes:
+            filt.remove_class("visible")
+            filt.value = ""
+            self.query_one(AgentList).focus()
+            return
         pane = self.query_one(WindowPane)
         pane.expanded = False
         self._sync_windows()
@@ -308,7 +454,6 @@ class StopApp(App[None]):
             self._narrow_page = order[(i + 1) % len(order)]
             self._apply_breakpoint()
             return
-        # wide: rotate focus
         focused = self.focused
         sequence = [AgentList, WindowPane, ActiveNowPane]
         if focused is None:
@@ -340,17 +485,21 @@ class StopApp(App[None]):
         self.query_one(ActiveNowPane).focus()
 
     def action_help(self) -> None:
-        self.notify(
-            "jk/↑↓ agents · Enter expand · Esc collapse · Tab cycle · "
-            "f follow-lock · a Active Now · / filter · q quit",
-            title="stop",
-        )
+        self.push_screen(HelpScreen())
 
     def action_filter(self) -> None:
-        self.notify(
-            "Filter via ~/.config/stop/config.toml hide_agents for now",
-            title="filter",
-        )
+        filt = self.query_one("#filter", Input)
+        filt.add_class("visible")
+        filt.value = self._filter
+        filt.focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id != "filter":
+            return
+        self._filter = event.value.strip()
+        event.input.remove_class("visible")
+        self.query_one(AgentList).focus()
+        self.refresh_host()
 
 
 def run_app(*, fixture: str | None = None, config_path: str | None = None) -> None:

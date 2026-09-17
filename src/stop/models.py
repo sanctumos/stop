@@ -43,6 +43,9 @@ class Window:
     last_activity_epoch: float = 0.0
     seconds_missing: float = 0.0
     last_scrollback: str = ""
+    bridge_inbox_count: int | None = None
+    bridge_outbox_count: int | None = None
+    returned_at_epoch: float = 0.0
 
 
 @dataclass

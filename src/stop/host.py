@@ -9,9 +9,34 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 
 from .discovery import build_agents
-from .models import CrashEvent, HostSnapshot, WindowState
+from .models import (
+    EXCLUDED_SCREEN_NAMES,
+    CrashEvent,
+    HostSnapshot,
+    WindowState,
+)
 from .parsers import parse_screen_list
 from .state import is_failure
+
+# Keep memory bounded — full Letta/Broca hardcopies can be 100KB–MB each.
+SCROLLBACK_MAX_BYTES = 32_768
+SCROLLBACK_MAX_LINES = 120
+HARDCOPY_TIMEOUT_S = 1.5
+
+
+def _tail_text(text: str, *, max_bytes: int = SCROLLBACK_MAX_BYTES, max_lines: int = SCROLLBACK_MAX_LINES) -> str:
+    if not text:
+        return ""
+    if len(text) > max_bytes:
+        text = text[-max_bytes:]
+        # avoid starting mid-line
+        nl = text.find("\n")
+        if nl != -1 and nl < len(text) - 1:
+            text = text[nl + 1 :]
+    lines = text.splitlines()
+    if len(lines) > max_lines:
+        lines = lines[-max_lines:]
+    return "\n".join(lines)
 
 
 class HostBackend(ABC):
@@ -25,16 +50,7 @@ class HostBackend(ABC):
 
 
 class FixtureHost(HostBackend):
-    """Fake host rooted at a fixture directory.
-
-    Layout:
-      crontab.txt
-      screen-list.txt          (or screen-list.N.txt for tick N)
-      agents/<name>/...
-      logs/<name>-broca-cron.log
-      scrollback/<screen>.txt
-      tick                     (optional int file; advanced by bump_tick)
-    """
+    """Fake host rooted at a fixture directory."""
 
     def __init__(self, root: Path):
         self.root = Path(root)
@@ -70,28 +86,44 @@ class FixtureHost(HostBackend):
             logs_root=self.root / "logs",
             now_epoch=time.time(),
         )
-        # Activity from scrollback mtimes / content length
         for agent in agents:
             for w in agent.windows:
                 if w.screen_name:
                     sb = self.root / "scrollback" / f"{w.screen_name}.txt"
                     if sb.is_file():
-                        w.last_scrollback = sb.read_text()
+                        w.last_scrollback = _tail_text(sb.read_text())
                         w.last_activity_epoch = sb.stat().st_mtime
                 elif w.log_path:
                     p = Path(w.log_path)
                     if p.is_file():
                         w.last_activity_epoch = p.stat().st_mtime
-                # Crash events
+                # otto_bridge counts (fixture + live share this shape)
+                if agent.name != "System" and w.screen_name and w.screen_name.startswith("broca-"):
+                    bridge = self.root / "agents" / agent.name / "broca" / "run" / "otto_bridge"
+                    if bridge.is_dir():
+                        try:
+                            inbox = bridge / "inbox"
+                            outbox = bridge / "outbox"
+                            w.bridge_inbox_count = (
+                                sum(1 for f in inbox.iterdir() if f.is_file()) if inbox.is_dir() else 0
+                            )
+                            w.bridge_outbox_count = (
+                                sum(1 for f in outbox.iterdir() if f.is_file()) if outbox.is_dir() else 0
+                            )
+                            for d in (inbox, outbox):
+                                if d.is_dir():
+                                    for f in d.iterdir():
+                                        if f.is_file():
+                                            w.last_activity_epoch = max(
+                                                w.last_activity_epoch, f.stat().st_mtime
+                                            )
+                        except OSError:
+                            pass
                 prev = self._prev_states.get(w.id)
                 if prev is not None and not is_failure(prev) and is_failure(w.state):
-                    self._events.append(
-                        CrashEvent(time.time(), f"{w.label} died")
-                    )
+                    self._events.append(CrashEvent(time.time(), f"{w.label} died"))
                 if prev is not None and is_failure(prev) and w.state == WindowState.RETURNED:
-                    self._events.append(
-                        CrashEvent(time.time(), f"{w.label} back")
-                    )
+                    self._events.append(CrashEvent(time.time(), f"{w.label} back"))
                 self._prev_states[w.id] = (
                     WindowState.RUNNING
                     if w.state == WindowState.RETURNED
@@ -114,7 +146,7 @@ class FixtureHost(HostBackend):
     def read_scrollback(self, screen_name: str) -> str:
         p = self.root / "scrollback" / f"{screen_name}.txt"
         if p.is_file():
-            return p.read_text()
+            return _tail_text(p.read_text())
         return ""
 
 
@@ -135,6 +167,18 @@ class LiveHost(HostBackend):
         self.tmp.mkdir(mode=0o700, exist_ok=True)
         self._prev_states: dict[str, WindowState] = {}
         self._events: list[CrashEvent] = []
+        self._scroll_cache: dict[str, tuple[float, str]] = {}
+        self._cpu_primed = False
+        # Hardcopy is expensive — throttle and skip excluded screens.
+        self.hardcopy_interval_s = 2.0
+        self._last_hardcopy_epoch = 0.0
+        self._focus_screens: set[str] = set()
+        self._last_alive_epoch: dict[str, float] = {}
+        self._returned_at: dict[str, float] = {}
+
+    def set_focus_screens(self, names: set[str]) -> None:
+        """Prefer hardcopying these screens (selected agent + Active Now)."""
+        self._focus_screens = {n for n in names if n and n not in EXCLUDED_SCREEN_NAMES}
 
     def _read_crontab(self) -> str:
         try:
@@ -158,13 +202,17 @@ class LiveHost(HostBackend):
                 timeout=5,
                 check=False,
             )
-            # screen -ls returns 1 when sessions exist on some versions
             return r.stdout or r.stderr or ""
         except (OSError, subprocess.TimeoutExpired):
             return ""
 
     def snapshot(self) -> HostSnapshot:
         import psutil
+
+        now = time.time()
+        do_hardcopy = (now - self._last_hardcopy_epoch) >= self.hardcopy_interval_s
+        if do_hardcopy:
+            self._last_hardcopy_epoch = now
 
         crontab = self._read_crontab()
         screens = parse_screen_list(self._read_screen_list())
@@ -174,29 +222,105 @@ class LiveHost(HostBackend):
             screens=screens,
             previous=self._prev_states,
             logs_root=self.logs_root,
-            now_epoch=time.time(),
+            now_epoch=now,
         )
+
+        # Decide which screens to hardcopy this tick.
+        want: set[str] = set(self._focus_screens)
         for agent in agents:
             for w in agent.windows:
-                if w.screen_name and w.state not in (
-                    WindowState.MISSING,
-                    WindowState.UNMANAGED,
+                if not w.screen_name:
+                    continue
+                if w.screen_name in EXCLUDED_SCREEN_NAMES:
+                    continue
+                if w.state in (WindowState.MISSING, WindowState.UNMANAGED, WindowState.DEAD):
+                    continue
+                # Always include broca-* when focused empty (first paint): sample a few.
+                if not want and w.screen_name.startswith("broca-"):
+                    want.add(w.screen_name)
+                elif w.screen_name in want:
+                    pass
+        # Cap hardcopies per tick hard — moya is a 2-core box.
+        want = set(list(want)[:4])
+
+        for agent in agents:
+            for w in agent.windows:
+                if w.screen_name and w.screen_name in EXCLUDED_SCREEN_NAMES:
+                    # Never pull Letta/stop scrollback into the TUI.
+                    continue
+                if (
+                    do_hardcopy
+                    and w.screen_name
+                    and w.screen_name in want
+                    and w.state not in (WindowState.MISSING, WindowState.UNMANAGED)
                 ):
                     text = self.read_scrollback(w.screen_name)
                     stripped = text.strip()
                     if stripped:
-                        if stripped != (w.last_scrollback or "").strip():
-                            w.last_activity_epoch = time.time()
+                        prev_cached = self._scroll_cache.get(w.screen_name)
+                        prev_text = (prev_cached[1] if prev_cached else "").strip()
+                        if stripped != prev_text:
+                            w.last_activity_epoch = now
                         w.last_scrollback = text
+                        self._scroll_cache[w.screen_name] = (now, text)
+                elif w.screen_name and w.screen_name in self._scroll_cache:
+                    # Reuse last good capture between hardcopy ticks.
+                    _, cached = self._scroll_cache[w.screen_name]
+                    w.last_scrollback = cached
                 elif w.log_path:
                     p = Path(w.log_path)
                     if p.is_file():
-                        w.last_activity_epoch = p.stat().st_mtime
+                        try:
+                            mtime = p.stat().st_mtime
+                            w.last_activity_epoch = max(w.last_activity_epoch, mtime)
+                        except OSError:
+                            pass
+
+                # otto_bridge counts + mtime (file counts only — no DB)
+                if agent.name != "System" and w.screen_name and w.screen_name.startswith("broca-"):
+                    bridge = self.agents_root / agent.name / "broca" / "run" / "otto_bridge"
+                    if bridge.is_dir():
+                        latest = 0.0
+                        inbox_n = outbox_n = 0
+                        try:
+                            for sub, counter in (("inbox", "in"), ("outbox", "out")):
+                                d = bridge / sub
+                                if d.is_dir():
+                                    n = 0
+                                    for f in d.iterdir():
+                                        if f.is_file():
+                                            n += 1
+                                            latest = max(latest, f.stat().st_mtime)
+                                    if counter == "in":
+                                        inbox_n = n
+                                    else:
+                                        outbox_n = n
+                        except OSError:
+                            pass
+                        w.bridge_inbox_count = inbox_n
+                        w.bridge_outbox_count = outbox_n
+                        if latest > w.last_activity_epoch:
+                            w.last_activity_epoch = latest
+
+                # seconds missing since last alive
+                if w.state in (WindowState.RUNNING, WindowState.RETURNED):
+                    self._last_alive_epoch[w.id] = now
+                    w.seconds_missing = 0.0
+                elif is_failure(w.state):
+                    last = self._last_alive_epoch.get(w.id)
+                    w.seconds_missing = (now - last) if last else 0.0
+
                 prev = self._prev_states.get(w.id)
                 if prev is not None and not is_failure(prev) and is_failure(w.state):
-                    self._events.append(CrashEvent(time.time(), f"{w.label} died"))
+                    self._events.append(CrashEvent(now, f"{w.label} died"))
                 if prev is not None and is_failure(prev) and w.state == WindowState.RETURNED:
-                    self._events.append(CrashEvent(time.time(), f"{w.label} back"))
+                    self._events.append(CrashEvent(now, f"{w.label} back"))
+                    self._returned_at[w.id] = now
+                if w.state == WindowState.RETURNED:
+                    w.returned_at_epoch = self._returned_at.get(w.id, now)
+                    # After 3s flash, treat as running for subsequent ticks.
+                    if now - w.returned_at_epoch >= 3.0:
+                        w.state = WindowState.RUNNING
                 self._prev_states[w.id] = (
                     WindowState.RUNNING
                     if w.state == WindowState.RETURNED
@@ -208,9 +332,11 @@ class LiveHost(HostBackend):
 
         vm = psutil.virtual_memory()
         net = psutil.net_io_counters()
-        # Prime CPU counter so the first reading isn't a useless spike/zero.
-        psutil.cpu_percent(interval=None)
-        cpu = psutil.cpu_percent(interval=0.05)
+        if not self._cpu_primed:
+            psutil.cpu_percent(interval=None)
+            self._cpu_primed = True
+        # Never block the UI thread with interval>0.
+        cpu = psutil.cpu_percent(interval=None)
         load = os.getloadavg() if hasattr(os, "getloadavg") else (0.0, 0.0, 0.0)
         return HostSnapshot(
             agents=agents,
@@ -226,7 +352,7 @@ class LiveHost(HostBackend):
 
     def read_scrollback(self, screen_name: str) -> str:
         """Hardcopy into our tmp dir only — never attach, never quit."""
-        if screen_name in ("stop",):
+        if screen_name in EXCLUDED_SCREEN_NAMES:
             return ""
         out = self.tmp / f"{screen_name}.txt"
         try:
@@ -234,11 +360,18 @@ class LiveHost(HostBackend):
                 ["screen", "-S", screen_name, "-X", "hardcopy", "-h", str(out)],
                 capture_output=True,
                 text=True,
-                timeout=3,
+                timeout=HARDCOPY_TIMEOUT_S,
                 check=False,
             )
             if out.is_file():
-                return out.read_text(errors="replace")
+                # Read only the tail of the file to bound memory.
+                size = out.stat().st_size
+                with out.open("rb") as f:
+                    if size > SCROLLBACK_MAX_BYTES:
+                        f.seek(-SCROLLBACK_MAX_BYTES, os.SEEK_END)
+                    raw = f.read()
+                text = raw.decode("utf-8", errors="replace")
+                return _tail_text(text)
         except (OSError, subprocess.TimeoutExpired):
             pass
         return ""
