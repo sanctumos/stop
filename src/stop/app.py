@@ -144,9 +144,8 @@ class AgentList(Static):
             style = _state_style(a.state)
             badge = badge_label(a.state)
             age = _age(a.last_activity_epoch, now)
-            lines.append(
-                f"{mark} [{style}]{_plain(a.name):<10}[/{style}] {badge:<9} {age}"
-            )
+            # Compact one-liner: name · badge · age (must fit ~28 cols).
+            lines.append(f"{mark} [{style}]{a.name}[/{style}] {badge} · {age}")
         title = "agents"
         if self.filter:
             title += f" /{_plain(self.filter)}"
