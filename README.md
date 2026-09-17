@@ -9,7 +9,21 @@ Design + plan: DSC Tasks Doc #1376 (SanctumOS board, list "stop (SanctumOS procm
 
 ## Status
 
-v0 scaffold. Nothing to see yet.
+v1 on moya. Shared watch screen: `screen -x stop` (as `rizzn`).
+
+## Shared screen — do not destroy it
+
+Mark attaches with `screen -x stop`. **Never** kill, quit, or recreate that
+session from automation — it forces a rejoin.
+
+To pick up a new git revision on moya:
+
+```bash
+git -C ~/sanctum/repos/stop pull --ff-only
+~/sanctum/repos/stop/tools/reload-in-screen.sh   # Ctrl-C TUI + relaunch; session stays
+```
+
+Start the TUI **without** `exec` so `q` / Ctrl-C leaves bash alive inside the screen.
 
 ## Run
 
@@ -25,6 +39,7 @@ python3 -m venv .venv && .venv/bin/pip install -e .[dev]
   commands other than `hardcopy`. Scratch lives in `/tmp/stop-<uid>/`.
 - No restart buttons. Crashed windows go red and `stop` waits for the cron
   supervisor to bring them back.
+- Never destroy the shared `stop` screen (see above).
 
 ## Keys
 
