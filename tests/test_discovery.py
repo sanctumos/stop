@@ -22,6 +22,8 @@ def test_parse_crontab_agents():
 
 
 def test_parse_screen_list():
+    from datetime import datetime
+
     text = (FIXTURE / "screen-list.txt").read_text()
     sessions = parse_screen_list(text)
     by = {s.name: s for s in sessions}
@@ -29,6 +31,20 @@ def test_parse_screen_list():
     assert by["broca-athena"].status == "Detached"
     assert by["stop"].status == "Detached"
     assert by["letta"].pid == 1201
+    # Real process start from screen's timestamp field — not activity.
+    expected = datetime.strptime("09/07/2026 06:32:01 PM", "%m/%d/%Y %I:%M:%S %p").timestamp()
+    assert by["broca-athena"].started_at_epoch == expected
+
+
+def test_agent_list_uses_screen_uptime_not_activity():
+    import time
+
+    host = FixtureHost(FIXTURE)
+    snap = host.snapshot()
+    athena = next(a for a in snap.agents if a.name == "athena")
+    assert athena.started_at_epoch > 0
+    # started_at comes from screen list; must not equal a fresh "now".
+    assert time.time() - athena.started_at_epoch > 86400
 
 
 def test_parse_screen_dead():

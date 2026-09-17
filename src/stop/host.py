@@ -121,9 +121,14 @@ class FixtureHost(HostBackend):
                 elif w.log_path:
                     p = Path(w.log_path)
                     if p.is_file():
-                        w.last_activity_epoch = p.stat().st_mtime
                         text = _tail_file(p)
                         if text.strip():
+                            if not scrollback_delta_is_noise_only(
+                                w.last_scrollback, text
+                            ):
+                                w.last_activity_epoch = p.stat().st_mtime
+                            w.last_scrollback = text
+                        else:
                             w.last_scrollback = text
                 # otto_bridge counts (fixture + live share this shape)
                 if agent.name != "System" and w.screen_name and w.screen_name.startswith("broca-"):
@@ -300,14 +305,22 @@ class LiveHost(HostBackend):
                 elif w.log_path:
                     p = Path(w.log_path)
                     if p.is_file():
-                        try:
-                            mtime = p.stat().st_mtime
-                            w.last_activity_epoch = max(w.last_activity_epoch, mtime)
-                        except OSError:
-                            pass
                         # Always show a fresh log tail for cron/run panes.
                         text = _tail_file(p)
                         if text.strip():
+                            # Poll noise (webchat "Retrieved 0 messages", etc.) must
+                            # not bump last_activity — that made longfellow's age
+                            # reset every ~3s while the log grew.
+                            if not scrollback_delta_is_noise_only(
+                                w.last_scrollback, text
+                            ):
+                                try:
+                                    mtime = p.stat().st_mtime
+                                    w.last_activity_epoch = max(
+                                        w.last_activity_epoch, mtime
+                                    )
+                                except OSError:
+                                    pass
                             w.last_scrollback = text
 
                 # otto_bridge counts + mtime (file counts only — no DB)

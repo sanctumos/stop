@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from pathlib import Path
 
 from .models import ScreenSession
@@ -16,9 +17,31 @@ _SMCP_CRON_RE = re.compile(r"(?:^|\s)(?:\S+\s+){5}\S*?start-smcp\.sh\b")
 
 # 	1818.broca-athena	(09/07/2026 06:32:01 PM)	(Detached)
 # 	1201.letta	(09/07/2026 06:31:30 PM)	(Detached)
+# 	1874.broca-rico	(09/07/2026 06:32:01 PM)	(Dead ???)
 _SCREEN_LINE_RE = re.compile(
-    r"^\s*(?P<pid>\d+)\.(?P<name>[^\s\t]+)\s+.*\((?P<status>Detached|Attached|Dead[^)]*)\)\s*$"
+    r"^\s*(?P<pid>\d+)\.(?P<name>[^\s\t]+)\s+"
+    r"\((?P<started>[^)]+)\)\s+"
+    r"\((?P<status>Detached|Attached|Dead[^)]*)\)\s*$"
 )
+
+_STARTED_FMTS = (
+    "%m/%d/%Y %I:%M:%S %p",
+    "%m/%d/%Y %H:%M:%S",
+    "%d/%m/%Y %H:%M:%S",
+)
+
+
+def parse_screen_started(text: str) -> float:
+    """Parse screen's start timestamp → epoch seconds (0 on failure)."""
+    s = (text or "").strip()
+    if not s:
+        return 0.0
+    for fmt in _STARTED_FMTS:
+        try:
+            return datetime.strptime(s, fmt).timestamp()
+        except ValueError:
+            continue
+    return 0.0
 
 
 def parse_crontab(text: str) -> dict[str, str]:
@@ -59,6 +82,7 @@ def parse_screen_list(text: str) -> list[ScreenSession]:
                 name=m.group("name"),
                 pid=int(m.group("pid")),
                 status=status,
+                started_at_epoch=parse_screen_started(m.group("started")),
             )
         )
     return sessions

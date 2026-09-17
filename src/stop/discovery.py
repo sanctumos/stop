@@ -79,6 +79,7 @@ def build_agents(
                 screen_name=screen_name,
                 state=state,
                 last_seen_pid=screen.pid if screen else None,
+                started_at_epoch=screen.started_at_epoch if screen else 0.0,
             )
         ]
         # Separate run-log pane when broca/run/*.log exists (PRD §3).
@@ -110,6 +111,7 @@ def build_agents(
                 cron_managed=cron_managed,
                 start_script=start_path,
                 windows=windows,
+                started_at_epoch=windows[0].started_at_epoch,
             )
         )
 
@@ -135,14 +137,21 @@ def build_agents(
                 screen_name=sys_name,
                 state=state,
                 last_seen_pid=screen.pid if screen else None,
+                started_at_epoch=screen.started_at_epoch if screen else 0.0,
             )
         )
     if sys_windows:
+        # System uptime = oldest running sibling (letta/smcp).
+        started = min(
+            (w.started_at_epoch for w in sys_windows if w.started_at_epoch > 0),
+            default=0.0,
+        )
         agents.append(
             Agent(
                 name="System",
                 cron_managed=True,
                 windows=sys_windows,
+                started_at_epoch=started,
             )
         )
 

@@ -28,6 +28,8 @@ class ScreenSession:
     name: str
     pid: int
     status: str  # Detached | Attached | Dead | ...
+    # From screen's "(MM/DD/YYYY HH:MM:SS AM/PM)" field — process start, not activity.
+    started_at_epoch: float = 0.0
 
 
 @dataclass
@@ -41,6 +43,8 @@ class Window:
     state: WindowState = WindowState.MISSING
     last_seen_pid: Optional[int] = None
     last_activity_epoch: float = 0.0
+    # Screen session start (real process uptime clock). Log panes leave this 0.
+    started_at_epoch: float = 0.0
     seconds_missing: float = 0.0
     last_scrollback: str = ""
     bridge_inbox_count: int | None = None
@@ -57,6 +61,8 @@ class Agent:
     start_script: Optional[str] = None
     windows: list[Window] = field(default_factory=list)
     last_activity_epoch: float = 0.0
+    # Primary screen start (broca-* preferred) — what the agent list shows as uptime.
+    started_at_epoch: float = 0.0
 
     @property
     def state(self) -> WindowState:

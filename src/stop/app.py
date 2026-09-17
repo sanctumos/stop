@@ -31,6 +31,7 @@ def _state_style(state: WindowState) -> str:
 
 
 def _age(epoch: float, now: float | None = None) -> str:
+    """Compact duration since epoch (activity age or uptime)."""
     if not epoch:
         return "-"
     now = now or time.time()
@@ -39,7 +40,13 @@ def _age(epoch: float, now: float | None = None) -> str:
         return f"{sec}s"
     if sec < 3600:
         return f"{sec // 60}m"
-    return f"{sec // 3600}h"
+    if sec < 86400:
+        return f"{sec // 3600}h"
+    days = sec // 86400
+    hours = (sec % 86400) // 3600
+    if hours:
+        return f"{days}d{hours}h"
+    return f"{days}d"
 
 
 def _plain(text: str) -> str:
@@ -209,14 +216,13 @@ class AgentList(Static):
             mark = ">" if i == self.index else " "
             style = _state_style(a.state)
             badge = short_badge(a.state)
-            age = _age(a.last_activity_epoch, now)
-            # Cap absurd ages (stale unmanaged files) so the row stays one line.
-            if a.state == WindowState.UNMANAGED and (
-                not a.last_activity_epoch or (now - a.last_activity_epoch) > 86400
-            ):
-                age = "-"
+            # Agent list shows real screen uptime — not last_activity (that was
+            # resetting every few seconds when a chatty run log kept writing).
+            uptime = _age(a.started_at_epoch, now)
+            if a.state == WindowState.UNMANAGED and not a.started_at_epoch:
+                uptime = "-"
             # Compact one-liner for ~28 usable cols.
-            lines.append(f"{mark} [{style}]{a.name}[/{style}] {badge} {age}")
+            lines.append(f"{mark} [{style}]{a.name}[/{style}] {badge} {uptime}")
         title = "agents"
         if self.filter:
             title += f" /{self.filter}"
