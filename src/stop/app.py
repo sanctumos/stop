@@ -49,6 +49,41 @@ def _age(epoch: float, now: float | None = None) -> str:
     return f"{days}d"
 
 
+def _age_stable(epoch: float, now: float | None = None) -> str:
+    """Like _age, but sub-minute stays 'now' so the UI does not tick every second."""
+    if not epoch:
+        return "-"
+    now = now or time.time()
+    sec = max(0, int(now - epoch))
+    if sec < 60:
+        return "now"
+    if sec < 3600:
+        return f"{sec // 60}m"
+    if sec < 86400:
+        return f"{sec // 3600}h"
+    days = sec // 86400
+    hours = (sec % 86400) // 3600
+    if hours:
+        return f"{days}d{hours}h"
+    return f"{days}d"
+
+
+def _paint(widget: Static, body: str, *, title: str | None = None) -> None:
+    """Update a Static only when the body actually changed.
+
+    Idle screens produce identical hardcopies; re-calling Static.update() every
+    host tick still repaints and looks like the logs are scrolling. Bridge
+    count twitches must not force a log redraw either — put those in `title`.
+    """
+    if title is not None and getattr(widget, "_paint_title", None) != title:
+        widget.border_title = title
+        widget._paint_title = title
+    if getattr(widget, "_paint_body", None) == body:
+        return
+    widget._paint_body = body
+    widget.update(body)
+
+
 def _plain(text: str) -> str:
     """Make arbitrary log/UI text safe for Rich markup (escape ALL brackets)."""
     # rich.markup.escape only escapes tag-shaped [...] ; Broca logs also contain
@@ -226,41 +261,50 @@ class AgentList(Static):
         title = "agents"
         if self.filter:
             title += f" /{self.filter}"
-        self.border_title = title
-        self.update("\n".join(lines) if lines else "(none)")
+        _paint(self, "\n".join(lines) if lines else "(none)", title=title)
 
 
 class WindowPane(Static):
     can_focus = True
     expanded = False
 
+    @staticmethod
+    def _bridge_title_bit(w: Window) -> str:
+        if w.bridge_inbox_count is None:
+            return ""
+        return f" · bridge in={w.bridge_inbox_count} out={w.bridge_outbox_count or 0}"
+
     def show_agent(self, agent: Agent | None, win_index: int = 0) -> None:
         self._agent = agent
         self._win_index = win_index
         if agent is None:
-            self.border_title = "windows"
-            self.update("(select an agent)")
+            _paint(self, "(select an agent)", title="windows")
             return
         if self.expanded and agent.windows:
             w = agent.windows[win_index % len(agent.windows)]
             style = _state_style(w.state)
-            self.border_title = f"{agent.name} / {w.label} — Esc to collapse"
-            lines = [
-                f"[{style}]{badge_label(w.state)}[/{style}]"
-            ]
+            title = (
+                f"{agent.name} / {w.label}{self._bridge_title_bit(w)} — Esc to collapse"
+            )
+            lines = [f"[{style}]{badge_label(w.state)}[/{style}]"]
             if is_failure(w.state):
                 miss = f" — missing {int(w.seconds_missing)}s" if w.seconds_missing else ""
                 lines.append(f"[red]waiting for supervisor…{miss}[/red]")
-            if w.bridge_inbox_count is not None:
-                lines.append(
-                    f"[dim]otto bridge  inbox={w.bridge_inbox_count}  "
-                    f"outbox={w.bridge_outbox_count or 0}[/dim]"
-                )
             lines.extend(_safe_lines(w.last_scrollback, limit=60, width=160))
-            self.update("\n".join(lines) if lines else "(empty)")
+            _paint(
+                self,
+                "\n".join(lines) if lines else "(empty)",
+                title=title,
+            )
             return
-        self.border_title = f"{agent.name} windows — Enter to expand"
-        lines = []
+        # Bridge counts live in the title so outbox twitches don't repaint logs.
+        broca = next(
+            (w for w in agent.windows if (w.screen_name or "").startswith("broca-")),
+            None,
+        )
+        bit = self._bridge_title_bit(broca) if broca else ""
+        title = f"{agent.name} windows{bit} — Enter to expand"
+        lines: list[str] = []
         for i, w in enumerate(agent.windows):
             selected = i == win_index
             mark = ">" if selected else " "
@@ -276,16 +320,11 @@ class WindowPane(Static):
             )
             if is_failure(w.state):
                 lines.append("    [red]waiting for supervisor…[/red]")
-            if w.bridge_inbox_count is not None:
-                lines.append(
-                    f"    [dim]otto bridge  inbox={w.bridge_inbox_count}  "
-                    f"outbox={w.bridge_outbox_count or 0}[/dim]"
-                )
             # Selected window gets a real log view; others a short teaser.
             depth = 14 if selected else 2
             for pl in _safe_lines(w.last_scrollback, limit=depth, width=150):
                 lines.append(f"    {pl}")
-        self.update("\n".join(lines))
+        _paint(self, "\n".join(lines), title=title)
 
 
 class ActiveNowPane(Static):
@@ -296,34 +335,37 @@ class ActiveNowPane(Static):
 
         lock = " · LOCKED" if locked else ""
         if window is None:
-            self.border_title = f"Active Now{lock}"
-            self.update("[dim](idle — no agent console has produced output yet)[/dim]")
+            _paint(
+                self,
+                "[dim](idle — no agent console has produced output yet)[/dim]",
+                title=f"Active Now{lock}",
+            )
             return
         style = _state_style(window.state)
-        age = _age(window.last_activity_epoch)
+        age = _age_stable(window.last_activity_epoch)
         kind, hits, _ = classify_scrollback(window.last_scrollback)
         if kind == KIND_DIALOGUE:
-            kind_label = f"[green]● dialogue×{hits}[/green]"
+            kind_bit = f"dialogue×{hits}"
         elif kind == KIND_OTHER:
-            kind_label = "[cyan]● signal[/cyan]"
+            kind_bit = "signal"
         else:
-            kind_label = "[dim]○ quiet (bridge chatter only)[/dim]"
-        self.border_title = f"Active Now — {window.label}{lock}"
-        lines = [
-            f"[{style}]{badge_label(window.state)}[/{style}]  {kind_label}  age {age}"
-        ]
+            kind_bit = "quiet"
+        # Volatile bits (age, kind) stay in the title so the log body only
+        # repaints when scrollback text actually changes.
+        title = f"Active Now — {window.label} · {kind_bit} · {age}{lock}"
+        lines = [f"[{style}]{badge_label(window.state)}[/{style}]"]
         preview = _safe_lines(window.last_scrollback, limit=16, width=160)
         lines.extend(preview if preview else ["(no scrollback yet)"])
-        self.update("\n".join(lines))
+        _paint(self, "\n".join(lines), title=title)
 
 
 class EventStrip(Static):
     def show(self, snap: HostSnapshot) -> None:
         if not snap.events:
-            self.update("events: (none)")
+            _paint(self, "events: (none)")
             return
         bits = [_plain(e.message) for e in snap.events[-5:]]
-        self.update("events: " + " · ".join(bits))
+        _paint(self, "events: " + " · ".join(bits))
 
 
 class StopApp(App[None]):
