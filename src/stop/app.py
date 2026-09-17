@@ -225,17 +225,18 @@ class StopApp(App[None]):
 
     def _apply_breakpoint(self) -> None:
         size = self.size
-        self.remove_class("medium", "narrow", "tiny", "page-windows", "page-active")
+        screen = self.screen
+        screen.remove_class("medium", "narrow", "tiny", "page-windows", "page-active")
         if size.height < 24:
-            self.add_class("tiny")
+            screen.add_class("tiny")
         if size.width < 80:
-            self.add_class("narrow")
+            screen.add_class("narrow")
             if self._narrow_page == "windows":
-                self.add_class("page-windows")
+                screen.add_class("page-windows")
             elif self._narrow_page == "active":
-                self.add_class("page-active")
+                screen.add_class("page-active")
         elif size.width < 120:
-            self.add_class("medium")
+            screen.add_class("medium")
 
     def refresh_host(self) -> None:
         snap = self.host.snapshot()
@@ -291,7 +292,7 @@ class StopApp(App[None]):
         pane = self.query_one(WindowPane)
         pane.expanded = True
         self._sync_windows()
-        if "narrow" in self.classes:
+        if "narrow" in self.screen.classes:
             self._narrow_page = "windows"
             self._apply_breakpoint()
 
@@ -301,7 +302,7 @@ class StopApp(App[None]):
         self._sync_windows()
 
     def action_cycle(self) -> None:
-        if "narrow" in self.classes:
+        if "narrow" in self.screen.classes:
             order = ["agents", "windows", "active"]
             i = order.index(self._narrow_page)
             self._narrow_page = order[(i + 1) % len(order)]
@@ -333,7 +334,7 @@ class StopApp(App[None]):
         self.refresh_host()
 
     def action_focus_active(self) -> None:
-        if "narrow" in self.classes:
+        if "narrow" in self.screen.classes:
             self._narrow_page = "active"
             self._apply_breakpoint()
         self.query_one(ActiveNowPane).focus()
