@@ -24,8 +24,9 @@ def test_safe_lines_render_without_markup_error():
     lines = _safe_lines(raw, limit=10, width=200)
     assert len(lines) == 3
     buf = StringIO()
-    console = Console(file=buf, force_terminal=True, width=120)
-    # This is what Textual/Static.update does under the hood.
+    # highlight=False — otherwise Rich's highlighter rewrites [5 INFO] with ANSI
+    # and a literal substring assert flakes across Rich versions.
+    console = Console(file=buf, force_terminal=True, width=120, highlight=False)
     console.print("\n".join(lines))
     out = buf.getvalue()
     assert "[5 INFO]" in out
