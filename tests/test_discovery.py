@@ -110,6 +110,17 @@ def test_crash_return_timeline_and_events():
 
 
 def test_active_now_excludes_letta_and_prefers_hottest():
+    (FIXTURE / "tick").write_text("0")
+    # Explicit mtimes so checkout-clock doesn't flake which Broca wins.
+    import os
+    import time
+
+    now = time.time()
+    os.utime(FIXTURE / "scrollback" / "broca-athena.txt", (now - 30, now - 30))
+    os.utime(FIXTURE / "scrollback" / "broca-rico.txt", (now - 20, now - 20))
+    os.utime(FIXTURE / "scrollback" / "broca-ada.txt", (now - 1, now - 1))
+    os.utime(FIXTURE / "scrollback" / "letta.txt", (now, now))  # newest but excluded
+
     host = FixtureHost(FIXTURE)
     snap = host.snapshot()
     ranked = rank_active_windows(snap.agents)
@@ -119,7 +130,6 @@ def test_active_now_excludes_letta_and_prefers_hottest():
     active = pick_active_now(snap.agents)
     assert active is not None
     assert active.screen_name != "letta"
-    # ada scrollback was touched last in fixture setup
     assert active.screen_name == "broca-ada"
 
 
