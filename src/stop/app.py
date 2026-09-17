@@ -69,6 +69,12 @@ def _age_stable(epoch: float, now: float | None = None) -> str:
     return f"{days}d"
 
 
+
+def _set_title(widget, title: str) -> None:
+    """Set border title only when it changes (avoids chrome flicker)."""
+    if getattr(widget, "border_title", None) != title:
+        widget.border_title = title
+
 def _paint(widget: Static, body: str, *, title: str | None = None) -> None:
     """Update a Static only when the body actually changed.
 
@@ -302,14 +308,14 @@ class WindowPane(Vertical):
         log = self.query_one("#win-log", RichLog)
 
         if agent is None:
-            self.border_title = "windows"
+            _set_title(self, "windows")
             _paint(meta, "(select an agent)")
             self._feed.reset()
             log.clear()
             return
 
         if not agent.windows:
-            self.border_title = f"{agent.name} windows"
+            _set_title(self, f"{agent.name} windows")
             _paint(meta, "(no windows)")
             self._feed.reset()
             log.clear()
@@ -323,7 +329,7 @@ class WindowPane(Vertical):
         bit = self._bridge_bit(broca if not self.expanded else w)
 
         if self.expanded:
-            self.border_title = f"{agent.name} / {w.label}{bit} — Esc to collapse"
+            _set_title(self, f"{agent.name} / {w.label}{bit} — Esc to collapse")
             style = _state_style(w.state)
             head = f"[{style}]{badge_label(w.state)}[/{style}]"
             if is_failure(w.state):
@@ -331,7 +337,7 @@ class WindowPane(Vertical):
                 head += f"\n[red]waiting for supervisor…{miss}[/red]"
             _paint(meta, head)
         else:
-            self.border_title = f"{agent.name} windows{bit} — Enter to expand"
+            _set_title(self, f"{agent.name} windows{bit} — Enter to expand")
             lines: list[str] = []
             for i, win in enumerate(agent.windows):
                 mark = ">" if i == win_index else " "
@@ -382,7 +388,7 @@ class ActiveNowPane(Vertical):
         lock = " · LOCKED" if locked else ""
 
         if window is None:
-            self.border_title = f"Active Now{lock}"
+            _set_title(self, f"Active Now{lock}")
             _paint(meta, "[dim](idle — waiting for human/agent dialogue)[/dim]")
             self._feed.reset()
             log.clear()
@@ -397,7 +403,7 @@ class ActiveNowPane(Vertical):
             kind_bit = "signal"
         else:
             kind_bit = "quiet"
-        self.border_title = f"Active Now — {window.label} · {kind_bit} · {age}{lock}"
+        _set_title(self, f"Active Now — {window.label} · {kind_bit} · {age}{lock}")
         _paint(meta, f"[{style}]{badge_label(window.state)}[/{style}]")
         self._feed.sync(log, window.last_scrollback, source_key=window.id)
 

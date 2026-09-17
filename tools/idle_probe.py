@@ -17,7 +17,7 @@ class FakeLog:
     def clear(self) -> None:
         self.ops.append("CLEAR")
 
-    def write(self, line: str) -> None:
+    def write(self, line: str, scroll_end: bool | None = None) -> None:
         self.ops.append("W")
 
 
