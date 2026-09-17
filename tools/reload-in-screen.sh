@@ -21,10 +21,10 @@ if ! screen -ls 2>&1 | grep -qE "[0-9]+\.${SCREEN_NAME}[[:space:]]"; then
   exit 2
 fi
 
-# Interrupt the TUI only. Requires stop was started WITHOUT \`exec\` so bash survives.
-# Ctrl-C → brief pause → launch stop again. Screen session PID stays the same.
-screen -S "$SCREEN_NAME" -X stuff $'\003'
-sleep 0.4
+# Quit the TUI only (binding `q`). Requires stop was started WITHOUT `exec`
+# so bash stays alive inside the screen. Never send commands that kill screen.
+screen -S "$SCREEN_NAME" -X stuff 'q'
+sleep 0.6
 screen -S "$SCREEN_NAME" -X stuff $'cd ~/sanctum/repos/stop && source .venv/bin/activate && stop\n'
 
 # Smoke: process should appear within a few seconds.

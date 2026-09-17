@@ -77,11 +77,23 @@ def build_agents(
                 id=win_id,
                 label=f"broca-{name}",
                 screen_name=screen_name,
-                log_path=log_path,
                 state=state,
                 last_seen_pid=screen.pid if screen else None,
             )
         ]
+        # Separate run-log pane when broca/run/*.log exists (PRD §3).
+        if log_path:
+            windows.append(
+                Window(
+                    id=f"{name}/run-log",
+                    label="run log",
+                    log_path=log_path,
+                    state=WindowState.RUNNING if state in (
+                        WindowState.RUNNING,
+                        WindowState.RETURNED,
+                    ) else state,
+                )
+            )
         if cron_log:
             windows.append(
                 Window(

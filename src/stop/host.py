@@ -13,6 +13,7 @@ from .models import (
     EXCLUDED_SCREEN_NAMES,
     CrashEvent,
     HostSnapshot,
+    Window,
     WindowState,
 )
 from .parsers import parse_screen_list
@@ -37,6 +38,46 @@ def _tail_text(text: str, *, max_bytes: int = SCROLLBACK_MAX_BYTES, max_lines: i
     if len(lines) > max_lines:
         lines = lines[-max_lines:]
     return "\n".join(lines)
+
+
+def _tail_file(
+    path: Path,
+    *,
+    max_bytes: int = SCROLLBACK_MAX_BYTES,
+    max_lines: int = SCROLLBACK_MAX_LINES,
+) -> str:
+    """Read the tail of a log file without loading the whole thing."""
+    try:
+        if not path.is_file():
+            return ""
+        size = path.stat().st_size
+        with path.open("rb") as f:
+            if size > max_bytes:
+                f.seek(-max_bytes, os.SEEK_END)
+            raw = f.read()
+        return _tail_text(
+            raw.decode("utf-8", errors="replace"),
+            max_bytes=max_bytes,
+            max_lines=max_lines,
+        )
+    except OSError:
+        return ""
+
+
+def _bore_unit_active(unit: str) -> str | None:
+    """Return systemd --user is-active status, or None if unknown."""
+    try:
+        r = subprocess.run(
+            ["systemctl", "--user", "is-active", unit],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        status = (r.stdout or r.stderr or "").strip().splitlines()
+        return status[0] if status else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
 
 
 class HostBackend(ABC):
@@ -97,6 +138,9 @@ class FixtureHost(HostBackend):
                     p = Path(w.log_path)
                     if p.is_file():
                         w.last_activity_epoch = p.stat().st_mtime
+                        text = _tail_file(p)
+                        if text.strip():
+                            w.last_scrollback = text
                 # otto_bridge counts (fixture + live share this shape)
                 if agent.name != "System" and w.screen_name and w.screen_name.startswith("broca-"):
                     bridge = self.root / "agents" / agent.name / "broca" / "run" / "otto_bridge"
@@ -225,6 +269,31 @@ class LiveHost(HostBackend):
             now_epoch=now,
         )
 
+        # System: bore user units (status only — no hardcopy).
+        for agent in agents:
+            if agent.name != "System":
+                continue
+            for unit, label in (
+                ("bore-client.service", "bore-client"),
+                ("bore-ssh-client.service", "bore-ssh"),
+            ):
+                st = _bore_unit_active(unit)
+                if st is None:
+                    continue
+                agent.windows.append(
+                    Window(
+                        id=f"system/{label}",
+                        label=label,
+                        state=(
+                            WindowState.RUNNING
+                            if st == "active"
+                            else WindowState.MISSING
+                        ),
+                        last_scrollback=f"systemctl --user is-active {unit}\n→ {st}",
+                        last_activity_epoch=now if st == "active" else 0.0,
+                    )
+                )
+
         # Decide which screens to hardcopy this tick.
         want: set[str] = set(self._focus_screens)
         for agent in agents:
@@ -275,6 +344,10 @@ class LiveHost(HostBackend):
                             w.last_activity_epoch = max(w.last_activity_epoch, mtime)
                         except OSError:
                             pass
+                        # Always show a fresh log tail for cron/run panes.
+                        text = _tail_file(p)
+                        if text.strip():
+                            w.last_scrollback = text
 
                 # otto_bridge counts + mtime (file counts only — no DB)
                 if agent.name != "System" and w.screen_name and w.screen_name.startswith("broca-"):
