@@ -20,7 +20,14 @@ def rank_active_windows(
             if w.state == WindowState.UNMANAGED and w.last_activity_epoch <= 0:
                 continue
             candidates.append(w)
-    candidates.sort(key=lambda w: w.last_activity_epoch, reverse=True)
+
+    def _key(w: Window) -> tuple:
+        has_text = 1 if (w.last_scrollback or "").strip() else 0
+        is_broca = 1 if (w.screen_name or "").startswith("broca-") else 0
+        # Higher activity first; prefer real console text; prefer broca lanes.
+        return (w.last_activity_epoch, has_text, is_broca)
+
+    candidates.sort(key=_key, reverse=True)
     return candidates
 
 
