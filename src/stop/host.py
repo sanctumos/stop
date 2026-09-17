@@ -183,8 +183,9 @@ class LiveHost(HostBackend):
                     WindowState.UNMANAGED,
                 ):
                     text = self.read_scrollback(w.screen_name)
-                    if text:
-                        if text != w.last_scrollback:
+                    stripped = text.strip()
+                    if stripped:
+                        if stripped != (w.last_scrollback or "").strip():
                             w.last_activity_epoch = time.time()
                         w.last_scrollback = text
                 elif w.log_path:
