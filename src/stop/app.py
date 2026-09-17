@@ -11,11 +11,12 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Footer, Header, Input, Static
+from textual.widgets import Footer, Header, Input, RichLog, Static
 
 from .activity import pick_active_now
 from .config import StopConfig, apply_agent_order, load_config
 from .host import FixtureHost, HostBackend, LiveHost
+from .livelog import LiveLogFeed
 from .models import Agent, HostSnapshot, Window, WindowState
 from .state import badge_label, is_failure, short_badge
 
@@ -207,7 +208,7 @@ class HostStrip(Static):
             f"[b]NET[/b] [cyan]↑{self._rate(snap.net_up_bps)}[/cyan] [cyan]{up_spark}[/cyan] "
             f"[magenta]↓{self._rate(snap.net_down_bps)}[/magenta] [magenta]{down_spark}[/magenta]"
         )
-        self.update(line1 + "\n" + line2)
+        _paint(self, line1 + "\n" + line2)
 
 
 class AgentList(Static):
@@ -264,83 +265,129 @@ class AgentList(Static):
         _paint(self, "\n".join(lines) if lines else "(none)", title=title)
 
 
-class WindowPane(Static):
+class WindowPane(Vertical):
+    """Selected agent: compact window list + append-only live log."""
+
     can_focus = True
     expanded = False
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._feed = LiveLogFeed(limit=400, width=200)
+        self._agent: Agent | None = None
+        self._win_index = 0
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="win-meta")
+        yield RichLog(
+            id="win-log",
+            max_lines=400,
+            min_width=20,
+            wrap=False,
+            highlight=False,
+            markup=False,
+            auto_scroll=True,
+        )
+
     @staticmethod
-    def _bridge_title_bit(w: Window) -> str:
-        if w.bridge_inbox_count is None:
+    def _bridge_bit(w: Window | None) -> str:
+        if w is None or w.bridge_inbox_count is None:
             return ""
         return f" · bridge in={w.bridge_inbox_count} out={w.bridge_outbox_count or 0}"
 
     def show_agent(self, agent: Agent | None, win_index: int = 0) -> None:
         self._agent = agent
         self._win_index = win_index
+        meta = self.query_one("#win-meta", Static)
+        log = self.query_one("#win-log", RichLog)
+
         if agent is None:
-            _paint(self, "(select an agent)", title="windows")
+            self.border_title = "windows"
+            _paint(meta, "(select an agent)")
+            self._feed.reset()
+            log.clear()
             return
-        if self.expanded and agent.windows:
-            w = agent.windows[win_index % len(agent.windows)]
-            style = _state_style(w.state)
-            title = (
-                f"{agent.name} / {w.label}{self._bridge_title_bit(w)} — Esc to collapse"
-            )
-            lines = [f"[{style}]{badge_label(w.state)}[/{style}]"]
-            if is_failure(w.state):
-                miss = f" — missing {int(w.seconds_missing)}s" if w.seconds_missing else ""
-                lines.append(f"[red]waiting for supervisor…{miss}[/red]")
-            lines.extend(_safe_lines(w.last_scrollback, limit=60, width=160))
-            _paint(
-                self,
-                "\n".join(lines) if lines else "(empty)",
-                title=title,
-            )
+
+        if not agent.windows:
+            self.border_title = f"{agent.name} windows"
+            _paint(meta, "(no windows)")
+            self._feed.reset()
+            log.clear()
             return
-        # Bridge counts live in the title so outbox twitches don't repaint logs.
+
+        w = agent.windows[win_index % len(agent.windows)]
         broca = next(
-            (w for w in agent.windows if (w.screen_name or "").startswith("broca-")),
+            (x for x in agent.windows if (x.screen_name or "").startswith("broca-")),
             None,
         )
-        bit = self._bridge_title_bit(broca) if broca else ""
-        title = f"{agent.name} windows{bit} — Enter to expand"
-        lines: list[str] = []
-        for i, w in enumerate(agent.windows):
-            selected = i == win_index
-            mark = ">" if selected else " "
+        bit = self._bridge_bit(broca if not self.expanded else w)
+
+        if self.expanded:
+            self.border_title = f"{agent.name} / {w.label}{bit} — Esc to collapse"
             style = _state_style(w.state)
-            badge = badge_label(w.state)
-            pid = f" pid={w.last_seen_pid}" if w.last_seen_pid else ""
-            miss = ""
-            if is_failure(w.state) and w.seconds_missing:
-                miss = f" {int(w.seconds_missing)}s"
-            lines.append("")
-            lines.append(
-                f"{mark} [{style}]{_plain(w.label)}[/{style}] {badge}{miss}[dim]{pid}[/dim]"
-            )
+            head = f"[{style}]{badge_label(w.state)}[/{style}]"
             if is_failure(w.state):
-                lines.append("    [red]waiting for supervisor…[/red]")
-            # Selected window gets a real log view; others a short teaser.
-            depth = 14 if selected else 2
-            for pl in _safe_lines(w.last_scrollback, limit=depth, width=150):
-                lines.append(f"    {pl}")
-        _paint(self, "\n".join(lines), title=title)
+                miss = f" — missing {int(w.seconds_missing)}s" if w.seconds_missing else ""
+                head += f"\n[red]waiting for supervisor…{miss}[/red]"
+            _paint(meta, head)
+        else:
+            self.border_title = f"{agent.name} windows{bit} — Enter to expand"
+            lines: list[str] = []
+            for i, win in enumerate(agent.windows):
+                mark = ">" if i == win_index else " "
+                style = _state_style(win.state)
+                pid = f" pid={win.last_seen_pid}" if win.last_seen_pid else ""
+                miss = ""
+                if is_failure(win.state) and win.seconds_missing:
+                    miss = f" {int(win.seconds_missing)}s"
+                lines.append(
+                    f"{mark} [{style}]{_plain(win.label)}[/{style}] "
+                    f"{badge_label(win.state)}{miss}[dim]{pid}[/dim]"
+                )
+                if is_failure(win.state):
+                    lines.append("    [red]waiting for supervisor…[/red]")
+            _paint(meta, "\n".join(lines) if lines else "(none)")
+
+        # Live log = selected window only; append new lines, never rewrite on idle.
+        source_key = f"{agent.name}:{w.id}:{self.expanded}"
+        self._feed.sync(log, w.last_scrollback, source_key=source_key)
 
 
-class ActiveNowPane(Static):
+class ActiveNowPane(Vertical):
+    """Follow the hottest dialogue console — append-only live log."""
+
     can_focus = True
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._feed = LiveLogFeed(limit=200, width=200)
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="active-meta")
+        yield RichLog(
+            id="active-log",
+            max_lines=200,
+            min_width=20,
+            wrap=False,
+            highlight=False,
+            markup=False,
+            auto_scroll=True,
+        )
 
     def show(self, window: Window | None, locked: bool) -> None:
         from .activity import KIND_DIALOGUE, KIND_OTHER, classify_scrollback
 
+        meta = self.query_one("#active-meta", Static)
+        log = self.query_one("#active-log", RichLog)
         lock = " · LOCKED" if locked else ""
+
         if window is None:
-            _paint(
-                self,
-                "[dim](idle — no agent console has produced output yet)[/dim]",
-                title=f"Active Now{lock}",
-            )
+            self.border_title = f"Active Now{lock}"
+            _paint(meta, "[dim](idle — waiting for human/agent dialogue)[/dim]")
+            self._feed.reset()
+            log.clear()
             return
+
         style = _state_style(window.state)
         age = _age_stable(window.last_activity_epoch)
         kind, hits, _ = classify_scrollback(window.last_scrollback)
@@ -350,13 +397,9 @@ class ActiveNowPane(Static):
             kind_bit = "signal"
         else:
             kind_bit = "quiet"
-        # Volatile bits (age, kind) stay in the title so the log body only
-        # repaints when scrollback text actually changes.
-        title = f"Active Now — {window.label} · {kind_bit} · {age}{lock}"
-        lines = [f"[{style}]{badge_label(window.state)}[/{style}]"]
-        preview = _safe_lines(window.last_scrollback, limit=16, width=160)
-        lines.extend(preview if preview else ["(no scrollback yet)"])
-        _paint(self, "\n".join(lines), title=title)
+        self.border_title = f"Active Now — {window.label} · {kind_bit} · {age}{lock}"
+        _paint(meta, f"[{style}]{badge_label(window.state)}[/{style}]")
+        self._feed.sync(log, window.last_scrollback, source_key=window.id)
 
 
 class EventStrip(Static):
@@ -386,14 +429,16 @@ class StopApp(App[None]):
         width: 1fr; height: 100%;
         border: round $primary;
         padding: 0 1;
-        overflow-y: hidden;
     }
+    #win-meta { height: auto; max-height: 8; }
+    #win-log { height: 1fr; background: transparent; }
     #active {
         height: 1fr; min-height: 12;
         border: round $warning;
         padding: 0 1;
-        overflow-y: hidden;
     }
+    #active-meta { height: auto; max-height: 2; }
+    #active-log { height: 1fr; background: transparent; }
     #agents:focus, #windows:focus, #active:focus { border: round $success; }
     #filter { dock: bottom; display: none; height: 3; }
     #filter.visible { display: block; }
@@ -448,7 +493,7 @@ class StopApp(App[None]):
             self.host.hardcopy_interval_s = float(self.config.refresh_hardcopy_s)
 
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=True)
+        yield Header(show_clock=False)
         yield HostStrip(id="host")
         with Vertical(id="body"):
             with Horizontal(id="row"):
@@ -603,15 +648,25 @@ class StopApp(App[None]):
             self._apply_breakpoint()
             return
         focused = self.focused
-        sequence = [AgentList, WindowPane, ActiveNowPane]
-        if focused is None:
-            self.query_one(AgentList).focus()
+        ids = ("agents", "windows", "active")
+        widgets = {
+            "agents": self.query_one(AgentList),
+            "windows": self.query_one(WindowPane),
+            "active": self.query_one(ActiveNowPane),
+        }
+        current = None
+        node = focused
+        while node is not None:
+            nid = getattr(node, "id", None)
+            if nid in ids:
+                current = nid
+                break
+            node = node.parent
+        if current is None:
+            widgets["agents"].focus()
             return
-        for i, cls in enumerate(sequence):
-            if isinstance(focused, cls):
-                self.query_one(sequence[(i + 1) % len(sequence)]).focus()
-                return
-        self.query_one(AgentList).focus()
+        nxt = ids[(ids.index(current) + 1) % len(ids)]
+        widgets[nxt].focus()
 
     def action_toggle_follow(self) -> None:
         if self._snap is None:
