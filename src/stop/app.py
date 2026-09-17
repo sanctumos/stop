@@ -17,7 +17,7 @@ from .activity import pick_active_now
 from .config import StopConfig, apply_agent_order, load_config
 from .host import FixtureHost, HostBackend, LiveHost
 from .models import Agent, HostSnapshot, Window, WindowState
-from .state import badge_label, is_failure
+from .state import badge_label, is_failure, short_badge
 
 
 def _state_style(state: WindowState) -> str:
@@ -142,10 +142,15 @@ class AgentList(Static):
         for i, a in enumerate(self.visible()):
             mark = ">" if i == self.index else " "
             style = _state_style(a.state)
-            badge = badge_label(a.state)
+            badge = short_badge(a.state)
             age = _age(a.last_activity_epoch, now)
-            # Compact one-liner: name · badge · age (must fit ~28 cols).
-            lines.append(f"{mark} [{style}]{a.name}[/{style}] {badge} · {age}")
+            # Cap absurd ages (stale unmanaged files) so the row stays one line.
+            if a.state == WindowState.UNMANAGED and (
+                not a.last_activity_epoch or (now - a.last_activity_epoch) > 86400
+            ):
+                age = "-"
+            # Compact one-liner for ~28 usable cols.
+            lines.append(f"{mark} [{style}]{a.name}[/{style}] {badge} {age}")
         title = "agents"
         if self.filter:
             title += f" /{_plain(self.filter)}"

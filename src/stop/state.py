@@ -54,3 +54,14 @@ def badge_label(state: WindowState) -> str:
         WindowState.UNMANAGED: "unmanaged",
         WindowState.RETURNED: "returned",
     }[state]
+
+
+def short_badge(state: WindowState) -> str:
+    """Compact badge for the narrow agent list column."""
+    return {
+        WindowState.RUNNING: "run",
+        WindowState.DEAD: "DEAD",
+        WindowState.MISSING: "miss",
+        WindowState.UNMANAGED: "off",
+        WindowState.RETURNED: "back",
+    }[state]
