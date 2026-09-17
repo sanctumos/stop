@@ -8,6 +8,7 @@ import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 
+from .activity import pick_active_now, scrollback_delta_is_noise_only
 from .discovery import build_agents
 from .models import (
     EXCLUDED_SCREEN_NAMES,
@@ -154,13 +155,7 @@ class FixtureHost(HostBackend):
                             w.bridge_outbox_count = (
                                 sum(1 for f in outbox.iterdir() if f.is_file()) if outbox.is_dir() else 0
                             )
-                            for d in (inbox, outbox):
-                                if d.is_dir():
-                                    for f in d.iterdir():
-                                        if f.is_file():
-                                            w.last_activity_epoch = max(
-                                                w.last_activity_epoch, f.stat().st_mtime
-                                            )
+                            # counts only — bridge mtime must not drive Active Now
                         except OSError:
                             pass
                 prev = self._prev_states.get(w.id)
@@ -185,6 +180,9 @@ class FixtureHost(HostBackend):
             load_avg=(0.1, 0.1, 0.1),
             mem_used_gib=1.7,
             mem_total_gib=3.6,
+            mem_percent=47.0,
+            net_up_bps=1200.0,
+            net_down_bps=4800.0,
         )
 
     def read_scrollback(self, screen_name: str) -> str:
@@ -219,6 +217,8 @@ class LiveHost(HostBackend):
         self._focus_screens: set[str] = set()
         self._last_alive_epoch: dict[str, float] = {}
         self._returned_at: dict[str, float] = {}
+        # (epoch, bytes_sent, bytes_recv) for net rate
+        self._prev_net: tuple[float, int, int] | None = None
 
     def set_focus_screens(self, names: set[str]) -> None:
         """Prefer hardcopying these screens (selected agent + Active Now)."""
@@ -329,7 +329,10 @@ class LiveHost(HostBackend):
                         prev_cached = self._scroll_cache.get(w.screen_name)
                         prev_text = (prev_cached[1] if prev_cached else "").strip()
                         if stripped != prev_text:
-                            w.last_activity_epoch = now
+                            # Bridge/httpx noise must not bump activity epoch —
+                            # that was flipping Active Now between Brocas.
+                            if not scrollback_delta_is_noise_only(prev_text, stripped):
+                                w.last_activity_epoch = now
                         w.last_scrollback = text
                         self._scroll_cache[w.screen_name] = (now, text)
                 elif w.screen_name and w.screen_name in self._scroll_cache:
@@ -363,7 +366,6 @@ class LiveHost(HostBackend):
                                     for f in d.iterdir():
                                         if f.is_file():
                                             n += 1
-                                            latest = max(latest, f.stat().st_mtime)
                                     if counter == "in":
                                         inbox_n = n
                                     else:
@@ -372,8 +374,8 @@ class LiveHost(HostBackend):
                             pass
                         w.bridge_inbox_count = inbox_n
                         w.bridge_outbox_count = outbox_n
-                        if latest > w.last_activity_epoch:
-                            w.last_activity_epoch = latest
+                        # Do NOT bump last_activity_epoch from bridge file mtimes —
+                        # outbox churn flipped Active Now between Brocas constantly.
 
                 # seconds missing since last alive
                 if w.state in (WindowState.RUNNING, WindowState.RETURNED):
@@ -405,6 +407,15 @@ class LiveHost(HostBackend):
 
         vm = psutil.virtual_memory()
         net = psutil.net_io_counters()
+        sent = int(net.bytes_sent) if net else 0
+        recv = int(net.bytes_recv) if net else 0
+        up_bps = down_bps = 0.0
+        if self._prev_net is not None:
+            prev_t, prev_s, prev_r = self._prev_net
+            dt = max(0.001, now - prev_t)
+            up_bps = max(0.0, (sent - prev_s) / dt)
+            down_bps = max(0.0, (recv - prev_r) / dt)
+        self._prev_net = (now, sent, recv)
         if not self._cpu_primed:
             psutil.cpu_percent(interval=None)
             self._cpu_primed = True
@@ -419,8 +430,11 @@ class LiveHost(HostBackend):
             load_avg=load,
             mem_used_gib=(vm.total - vm.available) / (1024**3),
             mem_total_gib=vm.total / (1024**3),
-            net_bytes_sent=net.bytes_sent if net else 0,
-            net_bytes_recv=net.bytes_recv if net else 0,
+            mem_percent=float(vm.percent),
+            net_bytes_sent=sent,
+            net_bytes_recv=recv,
+            net_up_bps=up_bps,
+            net_down_bps=down_bps,
         )
 
     def read_scrollback(self, screen_name: str) -> str:

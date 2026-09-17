@@ -96,5 +96,9 @@ class HostSnapshot:
     load_avg: tuple[float, float, float] = (0.0, 0.0, 0.0)
     mem_used_gib: float = 0.0
     mem_total_gib: float = 0.0
+    mem_percent: float = 0.0
     net_bytes_sent: int = 0
     net_bytes_recv: int = 0
+    # Instantaneous rates (bytes/sec), btop-style — not lifetime counters.
+    net_up_bps: float = 0.0
+    net_down_bps: float = 0.0

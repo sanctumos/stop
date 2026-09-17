@@ -76,6 +76,7 @@ class HelpScreen(ModalScreen[None]):
             "?            this help\n"
             "q            quit\n\n"
             "No restart button — cron restarts agents.\n"
+            "Active Now follows human/agent dialogue — not otto_bridge chatter.\n"
             "Letta + stop screens excluded from Active Now.\n"
             "Log lines with [brackets] are escaped (cannot crash UI).\n\n"
             "[dim]Esc / q / ? to close[/dim]",
@@ -92,14 +93,42 @@ class HelpScreen(ModalScreen[None]):
 
 
 class HostStrip(Static):
+    """btop-ish two-line host meters (CPU / RAM / net rates)."""
+
+    @staticmethod
+    def _bar(pct: float, width: int = 10) -> str:
+        pct = max(0.0, min(100.0, pct))
+        filled = int(round((pct / 100.0) * width))
+        return "█" * filled + "░" * (width - filled)
+
+    @staticmethod
+    def _rate(bps: float) -> str:
+        if bps < 1024:
+            return f"{bps:5.0f} B/s"
+        if bps < 1024 * 1024:
+            return f"{bps / 1024:5.1f} KiB/s"
+        return f"{bps / (1024 * 1024):5.2f} MiB/s"
+
     def show(self, snap: HostSnapshot) -> None:
         load = snap.load_avg
-        self.update(
-            f"CPU {snap.cpu_percent:5.1f}%  "
-            f"load {load[0]:.2f} {load[1]:.2f} {load[2]:.2f}  "
-            f"RAM {snap.mem_used_gib:.1f}/{snap.mem_total_gib:.1f} GiB  "
-            f"net ↑{snap.net_bytes_sent // 1024}k ↓{snap.net_bytes_recv // 1024}k"
+        mem_pct = snap.mem_percent
+        if mem_pct <= 0 and snap.mem_total_gib > 0:
+            mem_pct = 100.0 * snap.mem_used_gib / snap.mem_total_gib
+        cpu_bar = self._bar(snap.cpu_percent)
+        ram_bar = self._bar(mem_pct)
+        # Color CPU/RAM bars by pressure.
+        cpu_style = "green" if snap.cpu_percent < 70 else ("yellow" if snap.cpu_percent < 90 else "red")
+        ram_style = "green" if mem_pct < 70 else ("yellow" if mem_pct < 90 else "red")
+        line1 = (
+            f"CPU [{cpu_style}]{cpu_bar}[/{cpu_style}] {snap.cpu_percent:5.1f}%   "
+            f"load {load[0]:.2f} {load[1]:.2f} {load[2]:.2f}"
         )
+        line2 = (
+            f"RAM [{ram_style}]{ram_bar}[/{ram_style}] "
+            f"{snap.mem_used_gib:.1f}/{snap.mem_total_gib:.1f} GiB ({mem_pct:.0f}%)   "
+            f"net ↑{self._rate(snap.net_up_bps)} ↓{self._rate(snap.net_down_bps)}"
+        )
+        self.update(line1 + "\n" + line2)
 
 
 class AgentList(Static):
@@ -214,15 +243,22 @@ class ActiveNowPane(Static):
     can_focus = True
 
     def show(self, window: Window | None, locked: bool) -> None:
+        from .activity import KIND_DIALOGUE, classify_scrollback
+
         lock = " [yellow]LOCKED[/yellow]" if locked else ""
         if window is None:
-            self.update(f"[b]Active Now[/b]{lock}\n(idle)")
+            self.update(
+                f"[b]Active Now[/b]{lock}\n"
+                "(idle — waiting for human/agent dialogue, not bridge noise)"
+            )
             return
         style = _state_style(window.state)
         age = _age(window.last_activity_epoch)
+        kind, hits, _ = classify_scrollback(window.last_scrollback)
+        kind_label = "dialogue" if kind == KIND_DIALOGUE else "signal"
         lines = [
             f"[b]Active Now[/b]{lock} — [{style}]{_plain(window.label)}[/{style}] "
-            f"{badge_label(window.state)}  age {age}"
+            f"{badge_label(window.state)}  {kind_label}×{hits}  age {age}"
         ]
         preview = _safe_lines(window.last_scrollback, limit=12, width=120)
         lines.extend(preview if preview else ["(no scrollback yet)"])
@@ -243,7 +279,7 @@ class StopApp(App[None]):
     SUB_TITLE = "SanctumOS-top"
     CSS = """
     Screen { layout: vertical; }
-    #host { height: 1; dock: top; background: $boost; padding: 0 1; }
+    #host { height: 2; dock: top; background: $boost; padding: 0 1; }
     #events { height: 1; dock: bottom; color: $text-muted; padding: 0 1; }
     #body { height: 1fr; }
     #row { height: 1fr; }
