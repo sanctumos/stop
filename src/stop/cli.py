@@ -19,6 +19,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run against a fake host layout (dev/testing) instead of the live machine.",
     )
     p.add_argument(
+        "--config",
+        metavar="PATH",
+        help="Optional config.toml (default ~/.config/stop/config.toml).",
+    )
+    p.add_argument(
         "--once",
         action="store_true",
         help="Print one discovery snapshot to stdout and exit (no TUI).",
@@ -49,7 +54,7 @@ def main(argv: list[str] | None = None) -> int:
 
     from .app import run_app
 
-    run_app(fixture=args.fixture)
+    run_app(fixture=args.fixture, config_path=args.config)
     return 0
 
 

@@ -207,12 +207,15 @@ class LiveHost(HostBackend):
 
         vm = psutil.virtual_memory()
         net = psutil.net_io_counters()
+        # Prime CPU counter so the first reading isn't a useless spike/zero.
+        psutil.cpu_percent(interval=None)
+        cpu = psutil.cpu_percent(interval=0.05)
         load = os.getloadavg() if hasattr(os, "getloadavg") else (0.0, 0.0, 0.0)
         return HostSnapshot(
             agents=agents,
             screens=screens,
             events=list(self._events[-50:]),
-            cpu_percent=psutil.cpu_percent(interval=None),
+            cpu_percent=cpu,
             load_avg=load,
             mem_used_gib=(vm.total - vm.available) / (1024**3),
             mem_total_gib=vm.total / (1024**3),
