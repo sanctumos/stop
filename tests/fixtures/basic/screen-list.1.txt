@@ -1,0 +1,8 @@
+There are screens on:
+	1818.broca-athena	(09/07/2026 06:32:01 PM)	(Detached)
+	1877.broca-ada	(09/07/2026 06:32:01 PM)	(Detached)
+	1874.broca-rico	(09/07/2026 06:32:01 PM)	(Dead ???)
+	1201.letta	(09/07/2026 06:31:30 PM)	(Detached)
+	1806.smcp	(09/07/2026 06:32:01 PM)	(Detached)
+	1732333.stop	(09/17/2026 05:35:10 PM)	(Detached)
+6 Sockets in /run/screen/S-rizzn.

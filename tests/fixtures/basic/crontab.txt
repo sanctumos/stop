@@ -1,0 +1,5 @@
+* * * * * /home/rizzn/sanctum/agents/athena/start-athena-broca.sh >> /home/rizzn/logs/athena-broca-cron.log 2>&1
+* * * * * /home/rizzn/sanctum/agents/ada/start-ada-broca.sh >> /home/rizzn/logs/ada-broca-cron.log 2>&1
+* * * * * /home/rizzn/sanctum/agents/rico/start-rico-broca.sh >> /home/rizzn/logs/rico-broca-cron.log 2>&1
+* * * * * /home/rizzn/start-letta-idempotent.sh >> /home/rizzn/logs/letta-cron.log 2>&1
+* * * * * /home/rizzn/sanctum/smcp/start-smcp.sh >> /home/rizzn/logs/smcp-cron.log 2>&1
