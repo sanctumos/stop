@@ -7,3 +7,4 @@ dist/
 .pytest_cache/
 .otto-githooks-installed
 /tmp/
+tests/fixtures/basic/tick
