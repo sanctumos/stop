@@ -14,7 +14,6 @@ from .models import (
     EXCLUDED_SCREEN_NAMES,
     CrashEvent,
     HostSnapshot,
-    Window,
     WindowState,
 )
 from .parsers import parse_screen_list
@@ -63,22 +62,6 @@ def _tail_file(
         )
     except OSError:
         return ""
-
-
-def _bore_unit_active(unit: str) -> str | None:
-    """Return systemd --user is-active status, or None if unknown."""
-    try:
-        r = subprocess.run(
-            ["systemctl", "--user", "is-active", unit],
-            capture_output=True,
-            text=True,
-            timeout=2,
-            check=False,
-        )
-        status = (r.stdout or r.stderr or "").strip().splitlines()
-        return status[0] if status else None
-    except (OSError, subprocess.TimeoutExpired):
-        return None
 
 
 class HostBackend(ABC):
@@ -268,31 +251,6 @@ class LiveHost(HostBackend):
             logs_root=self.logs_root,
             now_epoch=now,
         )
-
-        # System: bore user units (status only — no hardcopy).
-        for agent in agents:
-            if agent.name != "System":
-                continue
-            for unit, label in (
-                ("bore-client.service", "bore-client"),
-                ("bore-ssh-client.service", "bore-ssh"),
-            ):
-                st = _bore_unit_active(unit)
-                if st is None:
-                    continue
-                agent.windows.append(
-                    Window(
-                        id=f"system/{label}",
-                        label=label,
-                        state=(
-                            WindowState.RUNNING
-                            if st == "active"
-                            else WindowState.MISSING
-                        ),
-                        last_scrollback=f"systemctl --user is-active {unit}\n→ {st}",
-                        last_activity_epoch=now if st == "active" else 0.0,
-                    )
-                )
 
         # Decide which screens to hardcopy this tick.
         want: set[str] = set(self._focus_screens)

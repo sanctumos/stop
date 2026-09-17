@@ -122,7 +122,7 @@ def rank_active_windows(
                 continue
             if w.state == WindowState.UNMANAGED and w.last_activity_epoch <= 0:
                 continue
-            # Cron/run log / bore status panes are not Active Now targets.
+            # Cron/run log panes are not Active Now targets.
             if not w.screen_name:
                 continue
             if not (w.screen_name or "").startswith("broca-"):
