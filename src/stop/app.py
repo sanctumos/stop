@@ -120,11 +120,11 @@ class HostStrip(Static):
         cpu_style = "green" if snap.cpu_percent < 70 else ("yellow" if snap.cpu_percent < 90 else "red")
         ram_style = "green" if mem_pct < 70 else ("yellow" if mem_pct < 90 else "red")
         line1 = (
-            f"CPU [{cpu_style}]{cpu_bar}[/{cpu_style}] {snap.cpu_percent:5.1f}%   "
+            f"CPU [{cpu_style}]|{cpu_bar}|[/{cpu_style}] {snap.cpu_percent:5.1f}%   "
             f"load {load[0]:.2f} {load[1]:.2f} {load[2]:.2f}"
         )
         line2 = (
-            f"RAM [{ram_style}]{ram_bar}[/{ram_style}] "
+            f"RAM [{ram_style}]|{ram_bar}|[/{ram_style}] "
             f"{snap.mem_used_gib:.1f}/{snap.mem_total_gib:.1f} GiB ({mem_pct:.0f}%)   "
             f"net ↑{self._rate(snap.net_up_bps)} ↓{self._rate(snap.net_down_bps)}"
         )
