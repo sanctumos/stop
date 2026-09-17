@@ -155,15 +155,14 @@ def pick_active_now(
         # Lock target gone — fall through to auto.
     if not ranked:
         return None
-    # If the winner is noise-only and everything is noise, still show hottest broca
-    # but prefer idle when nothing has dialogue/other signal.
-    top = ranked[0]
-    kind, _, _ = classify_scrollback(top.last_scrollback)
-    if kind == KIND_NOISE:
-        # Fall back to any window with other/dialogue; else None → "(idle)".
-        for w in ranked:
-            k, _, _ = classify_scrollback(w.last_scrollback)
-            if k >= KIND_OTHER:
-                return w
-        return None
-    return top
+    # Prefer dialogue/other signal; if everything is noise, still show the top
+    # (stable — noise epochs are zeroed in the sort key, so no flip-flopping).
+    # The UI labels it "quiet" so Mark knows it's bridge chatter, not dialogue.
+    for w in ranked:
+        k, _, _ = classify_scrollback(w.last_scrollback)
+        if k >= KIND_OTHER:
+            return w
+    for w in ranked:
+        if (w.last_scrollback or "").strip():
+            return w
+    return ranked[0]

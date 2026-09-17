@@ -92,41 +92,78 @@ class HelpScreen(ModalScreen[None]):
             self.dismiss()
 
 
+_SPARK_BLOCKS = "▁▂▃▄▅▆▇█"
+
+
+def _spark(history: list[float], *, width: int = 24, vmax: float | None = None) -> str:
+    """Render a sparkline from history samples (newest last)."""
+    if not history:
+        return "▁" * width
+    samples = history[-width:]
+    pad = width - len(samples)
+    top = vmax if vmax and vmax > 0 else max(max(samples), 1e-9)
+    out = []
+    for v in samples:
+        idx = int((max(0.0, min(v, top)) / top) * (len(_SPARK_BLOCKS) - 1))
+        out.append(_SPARK_BLOCKS[idx])
+    return "▁" * pad + "".join(out)
+
+
 class HostStrip(Static):
-    """btop-ish two-line host meters (CPU / RAM / net rates)."""
+    """btop-ish host meters: bars + rolling sparklines for CPU and net."""
+
+    HISTORY = 60
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._cpu_hist: list[float] = []
+        self._up_hist: list[float] = []
+        self._down_hist: list[float] = []
 
     @staticmethod
-    def _bar(pct: float, width: int = 10) -> str:
+    def _bar(pct: float, width: int = 14) -> str:
         pct = max(0.0, min(100.0, pct))
         filled = int(round((pct / 100.0) * width))
-        return "█" * filled + "░" * (width - filled)
+        return "■" * filled + "·" * (width - filled)
 
     @staticmethod
     def _rate(bps: float) -> str:
         if bps < 1024:
-            return f"{bps:5.0f} B/s"
+            return f"{bps:6.0f} B/s  "
         if bps < 1024 * 1024:
-            return f"{bps / 1024:5.1f} KiB/s"
-        return f"{bps / (1024 * 1024):5.2f} MiB/s"
+            return f"{bps / 1024:6.1f} KiB/s"
+        return f"{bps / (1024 * 1024):6.2f} MiB/s"
+
+    @staticmethod
+    def _pressure_style(pct: float) -> str:
+        return "green" if pct < 70 else ("yellow" if pct < 90 else "red")
 
     def show(self, snap: HostSnapshot) -> None:
         load = snap.load_avg
         mem_pct = snap.mem_percent
         if mem_pct <= 0 and snap.mem_total_gib > 0:
             mem_pct = 100.0 * snap.mem_used_gib / snap.mem_total_gib
-        cpu_bar = self._bar(snap.cpu_percent)
-        ram_bar = self._bar(mem_pct)
-        # Color CPU/RAM bars by pressure.
-        cpu_style = "green" if snap.cpu_percent < 70 else ("yellow" if snap.cpu_percent < 90 else "red")
-        ram_style = "green" if mem_pct < 70 else ("yellow" if mem_pct < 90 else "red")
+
+        self._cpu_hist = (self._cpu_hist + [snap.cpu_percent])[-self.HISTORY:]
+        self._up_hist = (self._up_hist + [snap.net_up_bps])[-self.HISTORY:]
+        self._down_hist = (self._down_hist + [snap.net_down_bps])[-self.HISTORY:]
+
+        cpu_style = self._pressure_style(snap.cpu_percent)
+        ram_style = self._pressure_style(mem_pct)
+        cpu_spark = _spark(self._cpu_hist, vmax=100.0)
+        up_spark = _spark(self._up_hist)
+        down_spark = _spark(self._down_hist)
+
         line1 = (
-            f"CPU [{cpu_style}]|{cpu_bar}|[/{cpu_style}] {snap.cpu_percent:5.1f}%   "
-            f"load {load[0]:.2f} {load[1]:.2f} {load[2]:.2f}"
+            f"[b]CPU[/b] [{cpu_style}]{self._bar(snap.cpu_percent)}[/{cpu_style}] "
+            f"{snap.cpu_percent:5.1f}%  [{cpu_style}]{cpu_spark}[/{cpu_style}]  "
+            f"load [b]{load[0]:.2f}[/b] {load[1]:.2f} {load[2]:.2f}"
         )
         line2 = (
-            f"RAM [{ram_style}]|{ram_bar}|[/{ram_style}] "
-            f"{snap.mem_used_gib:.1f}/{snap.mem_total_gib:.1f} GiB ({mem_pct:.0f}%)   "
-            f"net ↑{self._rate(snap.net_up_bps)} ↓{self._rate(snap.net_down_bps)}"
+            f"[b]RAM[/b] [{ram_style}]{self._bar(mem_pct)}[/{ram_style}] "
+            f"{snap.mem_used_gib:4.1f}/{snap.mem_total_gib:.1f}G {mem_pct:3.0f}%  "
+            f"[b]NET[/b] [cyan]↑{self._rate(snap.net_up_bps)}[/cyan] [cyan]{up_spark}[/cyan] "
+            f"[magenta]↓{self._rate(snap.net_down_bps)}[/magenta] [magenta]{down_spark}[/magenta]"
         )
         self.update(line1 + "\n" + line2)
 
@@ -182,9 +219,9 @@ class AgentList(Static):
             lines.append(f"{mark} [{style}]{a.name}[/{style}] {badge} {age}")
         title = "agents"
         if self.filter:
-            title += f" /{_plain(self.filter)}"
-        body = "\n".join(lines) if lines else "(none)"
-        self.update(f"[b]{title}[/b]\n{body}")
+            title += f" /{self.filter}"
+        self.border_title = title
+        self.update("\n".join(lines) if lines else "(none)")
 
 
 class WindowPane(Static):
@@ -195,46 +232,52 @@ class WindowPane(Static):
         self._agent = agent
         self._win_index = win_index
         if agent is None:
-            self.update("[b]windows[/b]\n(select an agent)")
+            self.border_title = "windows"
+            self.update("(select an agent)")
             return
         if self.expanded and agent.windows:
             w = agent.windows[win_index % len(agent.windows)]
             style = _state_style(w.state)
+            self.border_title = f"{agent.name} / {w.label} — Esc to collapse"
             lines = [
-                f"[b]{_plain(agent.name)} / {_plain(w.label)}[/b] "
-                f"[{style}]{badge_label(w.state)}[/{style}]  (Esc to collapse)"
+                f"[{style}]{badge_label(w.state)}[/{style}]"
             ]
             if is_failure(w.state):
                 miss = f" — missing {int(w.seconds_missing)}s" if w.seconds_missing else ""
                 lines.append(f"[red]waiting for supervisor…{miss}[/red]")
             if w.bridge_inbox_count is not None:
                 lines.append(
-                    f"otto bridge  inbox={w.bridge_inbox_count}  "
-                    f"outbox={w.bridge_outbox_count or 0}"
+                    f"[dim]otto bridge  inbox={w.bridge_inbox_count}  "
+                    f"outbox={w.bridge_outbox_count or 0}[/dim]"
                 )
-            lines.extend(_safe_lines(w.last_scrollback, limit=40, width=140))
+            lines.extend(_safe_lines(w.last_scrollback, limit=60, width=160))
             self.update("\n".join(lines) if lines else "(empty)")
             return
-        lines = [f"[b]{_plain(agent.name)} windows[/b]"]
+        self.border_title = f"{agent.name} windows — Enter to expand"
+        lines = []
         for i, w in enumerate(agent.windows):
-            mark = ">" if i == win_index else " "
+            selected = i == win_index
+            mark = ">" if selected else " "
             style = _state_style(w.state)
             badge = badge_label(w.state)
             pid = f" pid={w.last_seen_pid}" if w.last_seen_pid else ""
             miss = ""
             if is_failure(w.state) and w.seconds_missing:
                 miss = f" {int(w.seconds_missing)}s"
+            lines.append("")
             lines.append(
-                f"{mark} [{style}]{_plain(w.label)}[/{style}] {badge}{miss}{pid}"
+                f"{mark} [{style}]{_plain(w.label)}[/{style}] {badge}{miss}[dim]{pid}[/dim]"
             )
             if is_failure(w.state):
                 lines.append("    [red]waiting for supervisor…[/red]")
             if w.bridge_inbox_count is not None:
                 lines.append(
-                    f"    otto bridge  inbox={w.bridge_inbox_count}  "
-                    f"outbox={w.bridge_outbox_count or 0}"
+                    f"    [dim]otto bridge  inbox={w.bridge_inbox_count}  "
+                    f"outbox={w.bridge_outbox_count or 0}[/dim]"
                 )
-            for pl in _safe_lines(w.last_scrollback, limit=4, width=100):
+            # Selected window gets a real log view; others a short teaser.
+            depth = 14 if selected else 2
+            for pl in _safe_lines(w.last_scrollback, limit=depth, width=150):
                 lines.append(f"    {pl}")
         self.update("\n".join(lines))
 
@@ -243,24 +286,27 @@ class ActiveNowPane(Static):
     can_focus = True
 
     def show(self, window: Window | None, locked: bool) -> None:
-        from .activity import KIND_DIALOGUE, classify_scrollback
+        from .activity import KIND_DIALOGUE, KIND_OTHER, classify_scrollback
 
-        lock = " [yellow]LOCKED[/yellow]" if locked else ""
+        lock = " · LOCKED" if locked else ""
         if window is None:
-            self.update(
-                f"[b]Active Now[/b]{lock}\n"
-                "(idle — waiting for human/agent dialogue, not bridge noise)"
-            )
+            self.border_title = f"Active Now{lock}"
+            self.update("[dim](idle — no agent console has produced output yet)[/dim]")
             return
         style = _state_style(window.state)
         age = _age(window.last_activity_epoch)
         kind, hits, _ = classify_scrollback(window.last_scrollback)
-        kind_label = "dialogue" if kind == KIND_DIALOGUE else "signal"
+        if kind == KIND_DIALOGUE:
+            kind_label = f"[green]● dialogue×{hits}[/green]"
+        elif kind == KIND_OTHER:
+            kind_label = "[cyan]● signal[/cyan]"
+        else:
+            kind_label = "[dim]○ quiet (bridge chatter only)[/dim]"
+        self.border_title = f"Active Now — {window.label}{lock}"
         lines = [
-            f"[b]Active Now[/b]{lock} — [{style}]{_plain(window.label)}[/{style}] "
-            f"{badge_label(window.state)}  {kind_label}×{hits}  age {age}"
+            f"[{style}]{badge_label(window.state)}[/{style}]  {kind_label}  age {age}"
         ]
-        preview = _safe_lines(window.last_scrollback, limit=12, width=120)
+        preview = _safe_lines(window.last_scrollback, limit=16, width=160)
         lines.extend(preview if preview else ["(no scrollback yet)"])
         self.update("\n".join(lines))
 
@@ -282,10 +328,25 @@ class StopApp(App[None]):
     #host { height: 2; dock: top; background: $boost; padding: 0 1; }
     #events { height: 1; dock: bottom; color: $text-muted; padding: 0 1; }
     #body { height: 1fr; }
-    #row { height: 1fr; }
-    #agents { width: 32; border: solid $accent; padding: 0 1; }
-    #windows { width: 1fr; border: solid $primary; padding: 0 1; }
-    #active { height: 14; border: solid $warning; padding: 0 1; }
+    #row { height: 2fr; }
+    #agents {
+        width: 30; height: 100%;
+        border: round $accent; border-title-align: left;
+        padding: 0 1;
+    }
+    #windows {
+        width: 1fr; height: 100%;
+        border: round $primary;
+        padding: 0 1;
+        overflow-y: hidden;
+    }
+    #active {
+        height: 1fr; min-height: 12;
+        border: round $warning;
+        padding: 0 1;
+        overflow-y: hidden;
+    }
+    #agents:focus, #windows:focus, #active:focus { border: round $success; }
     #filter { dock: bottom; display: none; height: 3; }
     #filter.visible { display: block; }
 
@@ -299,8 +360,7 @@ class StopApp(App[None]):
         padding: 1 2;
     }
 
-    Screen.medium #agents { width: 28; }
-    Screen.medium #active { height: 10; }
+    Screen.medium #agents { width: 26; }
 
     Screen.narrow #row { layout: vertical; }
     Screen.narrow #agents { width: 1fr; height: 1fr; }

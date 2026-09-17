@@ -81,7 +81,8 @@ def test_active_now_prefers_dialogue_over_newer_bridge_noise():
     assert hits >= 1
 
 
-def test_all_noise_yields_idle():
+def test_all_noise_still_shows_quiet_window():
+    """Noise-only hosts show the hottest console labeled quiet — not an empty pane."""
     now = time.time()
     noise = Window(
         id="ada/broca",
@@ -92,7 +93,11 @@ def test_all_noise_yields_idle():
         last_scrollback="Wrote Otto bridge response file: /tmp/x\n",
     )
     agents = [Agent(name="ada", cron_managed=True, windows=[noise])]
-    assert pick_active_now(agents) is None
+    active = pick_active_now(agents)
+    assert active is not None
+    assert active.screen_name == "broca-ada"
+    kind, _, _ = classify_scrollback(active.last_scrollback)
+    assert kind == KIND_NOISE  # UI renders this as "quiet"
 
 
 def test_fixture_ada_still_wins_with_dialogue_text():
