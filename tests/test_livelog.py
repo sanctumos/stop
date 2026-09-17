@@ -21,14 +21,20 @@ def test_diff_replace_on_jump():
     assert diff_log_lines(["a", "b"], ["x", "y"]) == ("replace", ["x", "y"])
 
 
-def test_feed_idle_is_noop(monkeypatch):
+def test_diff_rejects_truncated_hardcopy():
+    old = [f"line-{i}" for i in range(80)]
+    assert diff_log_lines(old, []) == ("noop", [])
+    assert diff_log_lines(old, old[:5]) == ("noop", [])
+
+
+def test_feed_idle_is_noop():
     writes: list[str] = []
 
     class FakeLog:
         def clear(self) -> None:
             writes.append("CLEAR")
 
-        def write(self, line: str) -> None:
+        def write(self, line: str, scroll_end: bool | None = None) -> None:
             writes.append(line)
 
     feed = LiveLogFeed(limit=50)
@@ -37,3 +43,20 @@ def test_feed_idle_is_noop(monkeypatch):
     assert feed.sync(log, "one\ntwo\n", source_key="a") == "noop"
     assert feed.sync(log, "one\ntwo\nthree\n", source_key="a") == "append"
     assert writes == ["CLEAR", "one", "two", "three"]
+
+
+def test_feed_ignores_empty_after_good_buffer():
+    writes: list[str] = []
+
+    class FakeLog:
+        def clear(self) -> None:
+            writes.append("CLEAR")
+
+        def write(self, line: str, scroll_end: bool | None = None) -> None:
+            writes.append(line)
+
+    feed = LiveLogFeed(limit=50)
+    log = FakeLog()
+    feed.sync(log, "one\ntwo\nthree\n", source_key="a")
+    assert feed.sync(log, "", source_key="a") == "noop"
+    assert writes.count("CLEAR") == 1

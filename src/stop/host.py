@@ -409,10 +409,19 @@ class LiveHost(HostBackend):
         )
 
     def read_scrollback(self, screen_name: str) -> str:
-        """Hardcopy into our tmp dir only — never attach, never quit."""
+        """Hardcopy into our tmp dir only — never attach, never quit.
+
+        screen truncates the output file at the start of hardcopy, then writes.
+        Reading the shared path mid-write yields an empty/partial dump, which
+        made the TUI clear+rewrite the log every few ticks (false scrolling).
+        We hardcopy to a unique path, wait for a non-empty stable size, and
+        fall back to the last good cache on failure.
+        """
         if screen_name in EXCLUDED_SCREEN_NAMES:
             return ""
-        out = self.tmp / f"{screen_name}.txt"
+        cached = self._scroll_cache.get(screen_name)
+        cached_text = cached[1] if cached else ""
+        out = self.tmp / f"{screen_name}.{time.time_ns()}.hc"
         try:
             subprocess.run(
                 ["screen", "-S", screen_name, "-X", "hardcopy", "-h", str(out)],
@@ -421,15 +430,36 @@ class LiveHost(HostBackend):
                 timeout=HARDCOPY_TIMEOUT_S,
                 check=False,
             )
-            if out.is_file():
-                # Read only the tail of the file to bound memory.
-                size = out.stat().st_size
-                with out.open("rb") as f:
-                    if size > SCROLLBACK_MAX_BYTES:
-                        f.seek(-SCROLLBACK_MAX_BYTES, os.SEEK_END)
-                    raw = f.read()
-                text = raw.decode("utf-8", errors="replace")
-                return _tail_text(text)
+            prev_size = -1
+            size = 0
+            for _ in range(25):  # ~250ms max
+                try:
+                    if out.is_file():
+                        size = out.stat().st_size
+                        if size > 0 and size == prev_size:
+                            break
+                        prev_size = size
+                except OSError:
+                    pass
+                time.sleep(0.01)
+            if size <= 0:
+                return cached_text
+            with out.open("rb") as f:
+                if size > SCROLLBACK_MAX_BYTES:
+                    f.seek(-SCROLLBACK_MAX_BYTES, os.SEEK_END)
+                raw = f.read()
+            text = _tail_text(raw.decode("utf-8", errors="replace"))
+            # Reject obviously truncated tails when we already have a good buffer.
+            if cached_text and text:
+                cached_n = cached_text.count("\n")
+                new_n = text.count("\n")
+                if cached_n >= 40 and new_n < max(10, cached_n // 3):
+                    return cached_text
+            return text if text.strip() else cached_text
         except (OSError, subprocess.TimeoutExpired):
-            pass
-        return ""
+            return cached_text
+        finally:
+            try:
+                out.unlink(missing_ok=True)
+            except OSError:
+                pass

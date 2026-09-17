@@ -286,7 +286,7 @@ class WindowPane(Vertical):
             wrap=False,
             highlight=False,
             markup=False,
-            auto_scroll=True,
+            auto_scroll=False,
         )
 
     @staticmethod
@@ -371,7 +371,7 @@ class ActiveNowPane(Vertical):
             wrap=False,
             highlight=False,
             markup=False,
-            auto_scroll=True,
+            auto_scroll=False,
         )
 
     def show(self, window: Window | None, locked: bool) -> None:
