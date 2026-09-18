@@ -497,7 +497,7 @@ class ActiveNowPane(Vertical):
         age = _age_stable(window.last_activity_epoch)
         kind, hits, _ = classify_scrollback(window.last_scrollback)
         if kind == KIND_DIALOGUE:
-            kind_bit = f"dialogue×{hits}"
+            kind_bit = f"dialogue x{hits}"
         elif kind == KIND_OTHER:
             kind_bit = "signal"
         else:

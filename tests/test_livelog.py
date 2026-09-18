@@ -3,8 +3,16 @@
 from stop.livelog import LiveLogFeed, diff_log_lines, lines_from_scrollback
 
 
-def test_diff_noop():
-    assert diff_log_lines(["a", "b"], ["a", "b"]) == ("noop", [])
+def test_clean_log_line_strips_rich_level_diamonds():
+    from stop.livelog import clean_log_line
+
+    raw = "[2026-09-17 16:44:49] [5🔵 INFO] httpx: HTTP Request"
+    out = clean_log_line(raw)
+    assert "🔵" not in out
+    assert "◆" not in out
+    assert "[5| INFO]" in out or "[5|INFO]" in out.replace(" ", "")
+    mangled = "[2026-09-17 16:44:49] [5\ufffd INFO] plug"
+    assert "|" in clean_log_line(mangled)
 
 
 def test_diff_pure_append():

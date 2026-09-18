@@ -2,13 +2,52 @@
 
 from __future__ import annotations
 
+import unicodedata
+
 from textual.widgets import RichLog
+
+# Broca/Rich often put a colored emoji (🔵) between `[5` and `INFO]`. In many
+# terminal fonts that glyph renders as a diamond and floods every pane.
+_LOG_DOT_REPLACEMENTS = str.maketrans(
+    {
+        "🔵": "|",
+        "🟢": "|",
+        "🔴": "|",
+        "🟡": "|",
+        "🟠": "|",
+        "🟣": "|",
+        "⚪": "|",
+        "⚫": "|",
+        "◆": "|",
+        "◇": "|",
+        "♦": "|",
+        "♢": "|",
+        "●": "|",
+        "○": "|",
+        "\ufffd": "|",  # hardcopy replacement for emoji
+    }
+)
 
 
 def clean_log_line(line: str, *, width: int = 200) -> str:
-    """Strip controls; no Rich markup (RichLog markup=False)."""
-    cleaned = "".join(ch if ch >= " " or ch in "\t" else "?" for ch in line)
-    return cleaned.rstrip()[:width]
+    """Strip controls and decorative log dots; no Rich markup (RichLog markup=False)."""
+    text = (line or "").translate(_LOG_DOT_REPLACEMENTS)
+    out: list[str] = []
+    for ch in text:
+        if ch >= " " or ch in "\t":
+            # Drop leftover emoji / symbol-other that still look like diamonds.
+            o = ord(ch)
+            if o >= 0x1F300:  # misc emoji blocks
+                out.append("|")
+                continue
+            cat = unicodedata.category(ch)
+            if cat == "So" and not (0x2500 <= o <= 0x259F):
+                out.append("|")
+                continue
+            out.append(ch)
+        else:
+            out.append("?")
+    return "".join(out).rstrip()[:width]
 
 
 def lines_from_scrollback(text: str, *, limit: int = 200, width: int = 200) -> list[str]:
