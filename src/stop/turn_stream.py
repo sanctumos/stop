@@ -14,13 +14,13 @@ from pathlib import Path
 from typing import Callable
 
 # Broca console lines that mean a Letta turn just began.
+# Keep this tight: httpx "POST …/messages 200" logs when the request *finishes*
+# (after the turn), and would re-trigger a seek that wipes the linger panel.
 _TURN_START_RES = [
     re.compile(p, re.I)
     for p in (
         r"Processing message in LIVE mode",
-        r"Atomically dequeued message",
         r"Processing message with attached core block",
-        r"HTTP Request: POST http://(?:localhost|127\.0\.0\.1):\d+/v1/agents/[^/\s]+/messages",
     )
 ]
 
@@ -401,13 +401,19 @@ class TurnStreamWorker:
                 self.state.text = ""
                 self.state.run_id = ""
                 self.state.agent_name = ""
+            # Advance scroll cursor so lagging Broca lines (POST 200, detach)
+            # that arrived during linger do not look like a fresh turn start.
+            if selected_agent:
+                self._prev_scroll[selected_agent] = broca_scrollback or ""
             self._notify()
             return
 
-        if status in ("streaming", "seeking") or (
-            self._thread and self._thread.is_alive()
+        # Busy on a turn (including linger/error hold) — never re-trap.
+        if (
+            lingering
+            or status in ("streaming", "seeking", "linger", "error")
+            or (self._thread and self._thread.is_alive())
         ):
-            # Already on a turn.
             if selected_agent:
                 self._prev_scroll[selected_agent] = broca_scrollback or ""
             return

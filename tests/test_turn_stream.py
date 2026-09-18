@@ -31,6 +31,22 @@ def test_scrollback_ignores_noise_delta():
     assert scrollback_signals_turn_start(prev, new) is False
 
 
+def test_scrollback_ignores_lagging_http_post_ok():
+    """POST …/messages 200 is logged when the Letta call finishes — not a new turn."""
+    prev = "Processing message in LIVE mode\n"
+    new = (
+        prev
+        + 'HTTP Request: POST http://localhost:8284/v1/agents/agent-x/messages "HTTP/1.1 200 OK"\n'
+    )
+    assert scrollback_signals_turn_start(prev, new) is False
+
+
+def test_scrollback_ignores_dequeue_alone():
+    prev = "idle\n"
+    new = prev + "Atomically dequeued message (Queue ID: abc)\n"
+    assert scrollback_signals_turn_start(prev, new) is False
+
+
 def test_format_assistant_and_think():
     assert "hello" in format_stream_event(
         {"message_type": "assistant_message", "content": "hello"}
@@ -97,7 +113,7 @@ def test_toggle_off_clears_active(tmp_path: Path):
     w.tick(selected_agent="athena", broca_scrollback=prev)
     w.tick(
         selected_agent="athena",
-        broca_scrollback=prev + "Atomically dequeued message\n",
+        broca_scrollback=prev + "Processing message in LIVE mode\n",
     )
     assert w.snapshot().active is True
     w.set_enabled(False)
@@ -105,6 +121,36 @@ def test_toggle_off_clears_active(tmp_path: Path):
     assert snap.enabled is False
     assert snap.active is False
     assert snap.text == ""
+
+
+def test_linger_ignores_new_turn_signals(tmp_path: Path):
+    """Lagging Broca lines during linger must not wipe the completed turn text."""
+    w = TurnStreamWorker(agents_root=tmp_path)
+    now = time.time()
+    with w._lock:
+        w.state = TurnStreamState(
+            enabled=True,
+            active=True,
+            lingering=True,
+            agent_name="athena",
+            status="linger",
+            text="HELLO FROM TURN\n— turn complete —",
+            linger_until=now + 60.0,
+        )
+    w._prev_scroll["athena"] = "Processing message in LIVE mode\n"
+    w.tick(
+        selected_agent="athena",
+        broca_scrollback=(
+            "Processing message in LIVE mode\n"
+            'HTTP Request: POST http://localhost:8284/v1/agents/a/messages "HTTP/1.1 200 OK"\n'
+            "Processing message in LIVE mode\n"  # even a real-looking line
+        ),
+        now=now,
+    )
+    snap = w.snapshot()
+    assert snap.status == "linger"
+    assert "HELLO FROM TURN" in snap.text
+    assert "waiting for Letta run" not in snap.text
 
 
 def test_linger_expiry_clears(tmp_path: Path):
