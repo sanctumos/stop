@@ -500,11 +500,16 @@ def messages_to_text(rows: list[dict]) -> str:
 
 
 def message_identity(obj: dict) -> str:
-    """Stable id for merge arbitration (prefer server id, else content fingerprint)."""
+    """Stable identity for merge arbitration.
+
+    Letta can reuse one message id for reasoning + assistant records in the
+    same step, so message type is part of the identity. Deduping on id alone
+    silently dropped the final assistant output after a thinking record.
+    """
     mid = obj.get("id") or obj.get("message_id") or obj.get("ott_id")
-    if mid is not None and str(mid).strip():
-        return f"id:{mid}"
     mtype = obj.get("message_type") or obj.get("type") or ""
+    if mid is not None and str(mid).strip():
+        return f"id:{mid}:{mtype}"
     piece = format_stream_event(obj)
     return f"fp:{mtype}:{hash(piece)}"
 

@@ -43,6 +43,25 @@ def test_ordered_unique_dedupes_by_id():
     assert text == "hi\n\nthere"
 
 
+def test_ordered_unique_keeps_reasoning_and_assistant_with_same_id():
+    """Letta reuses a step message id across record types."""
+    rows = [
+        {
+            "id": "same",
+            "message_type": "reasoning_message",
+            "reasoning": "thinking",
+        },
+        {
+            "id": "same",
+            "message_type": "assistant_message",
+            "content": "FINAL",
+        },
+    ]
+    text = ordered_unique_message_text(rows)
+    assert "[think] thinking" in text
+    assert text.endswith("FINAL")
+
+
 def test_prune_seen_runs_keeps_newest():
     order = [f"r{i}" for i in range(12)]
     kept, s = prune_seen_runs(order, maxlen=5)
