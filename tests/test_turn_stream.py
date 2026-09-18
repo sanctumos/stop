@@ -388,13 +388,17 @@ def test_background_agent_turn_does_not_replace_focused(tmp_path: Path):
 
 
 def test_run_still_in_flight_and_status_helpers():
-    from stop.turn_stream import run_still_in_flight
+    from stop.turn_stream import bounded_turn_text, run_still_in_flight
 
     assert run_still_in_flight("running") is True
     assert run_still_in_flight("created") is True
     assert run_still_in_flight("") is True  # unknown → keep waiting
     assert run_still_in_flight("completed") is False
     assert run_still_in_flight("failed") is False
+    bounded = bounded_turn_text("r" * 20000 + "\nFINAL", "the query", max_chars=200)
+    assert bounded.startswith("> the query\n\n")
+    assert bounded.endswith("FINAL")
+    assert len(bounded) == 200
 
 
 def test_consume_stream_eof_while_running_keeps_going_then_merges_final(
@@ -470,7 +474,8 @@ def test_consume_stream_eof_while_running_keeps_going_then_merges_final(
         w.state.active = True
         w.state.agent_name = "athena"
         w.state.query = "hi"
-        w.state.text = "Live on run-1…\n(step stream — waiting for first model step)"
+        # Longer partial reasoning used to beat the completed API payload.
+        w.state.text = "[think] " + ("partial-but-longer-" * 700)
         w.state.status = "streaming"
         w._generation = 1
 
@@ -482,6 +487,7 @@ def test_consume_stream_eof_while_running_keeps_going_then_merges_final(
     assert snap.status == "linger"
     assert snap.active is True
     assert final in snap.text
+    assert snap.text.startswith("> hi\n\n")
     assert "— turn complete —" in snap.text
 
 

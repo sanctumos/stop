@@ -371,6 +371,20 @@ def with_query_header(body: str, query: str) -> str:
     return f"{header}\n\n{body}"
 
 
+def bounded_turn_text(body: str, query: str, *, max_chars: int = 12000) -> str:
+    """Bound turn text without truncating the user-query header."""
+    text = with_query_header(body, query)
+    if len(text) <= max_chars:
+        return text
+    q = (query or "").strip()
+    if not q:
+        return text[-max_chars:]
+    shown = q if len(q) <= 2000 else q[:2000] + "…"
+    header = f"> {shown}\n\n"
+    room = max(0, max_chars - len(header))
+    return header + text[-room:] if room else header[:max_chars]
+
+
 def _http_json(
     method: str,
     url: str,
@@ -1316,22 +1330,32 @@ class TurnStreamWorker:
                 time.sleep(0.8)
             rows = fetch_run_messages(creds, run_id)
             api_text = ordered_unique_message_text(rows)
-            if api_text:
-                text_now = merge_turn_bodies(
-                    text_now.replace("\n\n— turn complete —", "").strip(),
-                    api_text,
-                )
+            status = fetch_run_status(creds, run_id)
+
+        # A completed run's messages endpoint is authoritative. The previous
+        # length-based merge could retain a longer reasoning trace and discard
+        # a shorter payload that contained the final assistant message.
+        if api_text and not run_still_in_flight(status):
+            text_now = api_text
+        elif api_text:
+            text_now = merge_turn_bodies(
+                text_now.replace("\n\n— turn complete —", "").strip(),
+                api_text,
+            )
 
         with self._lock:
             if gen != self._generation or not self.state.enabled:
                 return
             q = self.state.query or q
             if text_now:
-                merged = merge_turn_bodies(
-                    self.state.text.replace("\n\n— turn complete —", "").strip(),
-                    with_query_header(text_now, q),
-                )
-                self.state.text = merged[-12000:]
+                if api_text and not run_still_in_flight(status):
+                    self.state.text = bounded_turn_text(api_text, q)
+                else:
+                    merged = merge_turn_bodies(
+                        self.state.text.replace("\n\n— turn complete —", "").strip(),
+                        with_query_header(text_now, q),
+                    )
+                    self.state.text = bounded_turn_text(merged, q)
             elif _is_placeholder(self.state.text or ""):
                 self.state.text = (
                     f"No stream content for {run_id}."
