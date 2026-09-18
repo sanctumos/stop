@@ -28,11 +28,19 @@ def test_unwrap_screen_hardcopy_rejoins_words_split_at_80_columns():
     raw = (
         "[2026-09-17 22:30:47] [5| INFO] runtime.core.queue: Processing message in LIVE m\n"
         "ode (queue timeout 120s)\n"
+        "[2026-09-17 22:30:48] [5| INFO] runtime.core.queue: Atomically dequeued message\n"
+        "(Queue ID: 42)\n"
+        "[2026-09-17 22:30:49] [5| INFO] Routing response through\n"
+        "otto_bridge handler\n"
         "[2026-09-17 22:30:48] [5| INFO] next event\n"
     )
     assert unwrap_screen_hardcopy(raw) == [
         "[2026-09-17 22:30:47] [5| INFO] runtime.core.queue: "
         "Processing message in LIVE mode (queue timeout 120s)",
+        "[2026-09-17 22:30:48] [5| INFO] runtime.core.queue: "
+        "Atomically dequeued message (Queue ID: 42)",
+        "[2026-09-17 22:30:49] [5| INFO] Routing response through "
+        "otto_bridge handler",
         "[2026-09-17 22:30:48] [5| INFO] next event",
     ]
     lines = lines_from_scrollback(raw)

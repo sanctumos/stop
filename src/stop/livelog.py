@@ -30,6 +30,23 @@ _LOG_DOT_REPLACEMENTS = str.maketrans(
 )
 
 _LOG_START_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}\]")
+_TAIL_WORD_RE = re.compile(r"([A-Za-z0-9]+)$")
+_HEAD_WORD_RE = re.compile(r"^([A-Za-z0-9]+)")
+
+
+def _screen_wrap_separator(previous: str, continuation: str) -> str:
+    """Recover spaces that screen drops at a physical line boundary."""
+    if not previous or not continuation:
+        return ""
+    if continuation[0] in "([{*":
+        return " "
+    if previous[-1] in "/-_=." or continuation[0] in "/-_=.":
+        return ""
+    tail = _TAIL_WORD_RE.search(previous)
+    head = _HEAD_WORD_RE.match(continuation)
+    if tail and head and (len(tail.group(1)) <= 4 or len(head.group(1)) <= 3):
+        return ""
+    return " "
 
 
 def unwrap_screen_hardcopy(text: str) -> list[str]:
@@ -52,7 +69,7 @@ def unwrap_screen_hardcopy(text: str) -> list[str]:
                 out.append(current)
                 current = None
         elif current is not None:
-            current += line
+            current += _screen_wrap_separator(current, line) + line
         else:
             out.append(line)
     if current is not None:
