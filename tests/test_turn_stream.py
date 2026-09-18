@@ -147,14 +147,60 @@ def test_worker_default_enabled_and_toggle(tmp_path: Path):
     assert w.snapshot().enabled is True
 
 
-def test_worker_first_paint_does_not_fire(tmp_path: Path):
+def test_worker_first_paint_fires_only_when_live_line_is_fresh(tmp_path: Path):
     w = TurnStreamWorker(agents_root=tmp_path)
     now = time.time()
     text = _live(now)
     w.tick(selected_agent="athena", broca_scrollback=text, now=now)
     snap = w.snapshot()
-    assert snap.active is False
-    assert snap.status == "idle"
+    assert snap.active is True
+    assert snap.status == "error"
+    assert "no Letta creds" in snap.error
+
+    stale = TurnStreamWorker(agents_root=tmp_path)
+    stale.tick(
+        selected_agent="athena",
+        broca_scrollback=_live(now - 600),
+        now=now,
+    )
+    assert stale.snapshot().active is False
+
+
+def test_bridge_probe_recovers_turn_already_in_progress(tmp_path: Path, monkeypatch):
+    from stop.turn_stream import LettaAgentCreds
+
+    w = TurnStreamWorker(agents_root=tmp_path)
+    started: list[dict] = []
+    monkeypatch.setattr(
+        "stop.turn_stream.fetch_broca_current_turn",
+        lambda *a, **k: {
+            "active": True,
+            "message": "QUERY ALREADY RUNNING",
+            "status": "processing",
+            "queue_id": 42,
+        },
+    )
+    monkeypatch.setattr(
+        "stop.turn_stream.load_agent_creds",
+        lambda *a, **k: LettaAgentCreds(
+            agent_name="athena",
+            agent_id="agent-x",
+            api_key="k",
+            endpoint="http://127.0.0.1:9",
+        ),
+    )
+
+    def fake_start(creds, **kwargs):
+        started.append(kwargs)
+
+    monkeypatch.setattr(w, "_start_seek", fake_start)
+    w.tick(selected_agent="athena", broca_scrollback="old idle log\n")
+    deadline = time.time() + 1
+    while not started and time.time() < deadline:
+        time.sleep(0.01)
+    assert started
+    assert started[0]["initial_query"] == "QUERY ALREADY RUNNING"
+    assert started[0]["allow_old_active"] is True
 
 
 def test_worker_second_tick_with_turn_seeks_without_creds(tmp_path: Path):

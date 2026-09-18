@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import unicodedata
 
 from textual.widgets import RichLog
@@ -28,6 +29,36 @@ _LOG_DOT_REPLACEMENTS = str.maketrans(
     }
 )
 
+_LOG_START_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}\]")
+
+
+def unwrap_screen_hardcopy(text: str) -> list[str]:
+    """Rejoin GNU screen's physical-width wraps into logical log records.
+
+    Broca screens are commonly 80 columns. ``screen -X hardcopy`` inserts real
+    newlines every 80 cells, even through words (``LIVE m`` / ``ode``). Once a
+    timestamped log record starts, non-timestamp lines are physical
+    continuations until the next timestamp or blank separator.
+    """
+    out: list[str] = []
+    current: str | None = None
+    for line in (text or "").splitlines():
+        if _LOG_START_RE.match(line):
+            if current is not None:
+                out.append(current)
+            current = line
+        elif not line:
+            if current is not None:
+                out.append(current)
+                current = None
+        elif current is not None:
+            current += line
+        else:
+            out.append(line)
+    if current is not None:
+        out.append(current)
+    return out
+
 
 def clean_log_line(line: str, *, width: int = 200) -> str:
     """Strip controls and decorative log dots; no Rich markup (RichLog markup=False)."""
@@ -51,7 +82,7 @@ def clean_log_line(line: str, *, width: int = 200) -> str:
 
 
 def lines_from_scrollback(text: str, *, limit: int = 200, width: int = 200) -> list[str]:
-    raw = (text or "").splitlines()
+    raw = unwrap_screen_hardcopy(text)
     # Keep trailing empties out of the stable comparison window.
     while raw and not raw[-1].strip():
         raw.pop()

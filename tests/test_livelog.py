@@ -1,6 +1,11 @@
 """Append-only live log sync."""
 
-from stop.livelog import LiveLogFeed, diff_log_lines, lines_from_scrollback
+from stop.livelog import (
+    LiveLogFeed,
+    diff_log_lines,
+    lines_from_scrollback,
+    unwrap_screen_hardcopy,
+)
 
 
 def test_clean_log_line_strips_rich_level_diamonds():
@@ -17,6 +22,22 @@ def test_clean_log_line_strips_rich_level_diamonds():
 
 def test_diff_noop():
     assert diff_log_lines(["a", "b"], ["a", "b"]) == ("noop", [])
+
+
+def test_unwrap_screen_hardcopy_rejoins_words_split_at_80_columns():
+    raw = (
+        "[2026-09-17 22:30:47] [5| INFO] runtime.core.queue: Processing message in LIVE m\n"
+        "ode (queue timeout 120s)\n"
+        "[2026-09-17 22:30:48] [5| INFO] next event\n"
+    )
+    assert unwrap_screen_hardcopy(raw) == [
+        "[2026-09-17 22:30:47] [5| INFO] runtime.core.queue: "
+        "Processing message in LIVE mode (queue timeout 120s)",
+        "[2026-09-17 22:30:48] [5| INFO] next event",
+    ]
+    lines = lines_from_scrollback(raw)
+    assert "LIVE mode" in lines[0]
+    assert all(line != "ode (queue timeout 120s)" for line in lines)
 
 
 def test_diff_pure_append():

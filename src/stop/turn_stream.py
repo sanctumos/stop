@@ -278,17 +278,17 @@ def broca_http_creds(agents_root: Path, agent_name: str) -> tuple[str, str] | No
     return base, key
 
 
-def fetch_broca_triggering_message(
+def fetch_broca_current_turn(
     agents_root: Path, agent_name: str
-) -> str:
-    """Fetch the user message that triggered the current Broca turn via HTTP.
+) -> dict:
+    """Fetch the current Broca turn via its published HTTP API.
 
     Uses ``GET {OTTO_BRIDGE_HTTP_LISTEN}/v1/turn/current`` (published Broca Otto
     bridge API). Never opens the Broca SQLite database from stop (#4069).
     """
     creds = broca_http_creds(agents_root, agent_name)
     if creds is None:
-        return ""
+        return {"active": False, "message": "", "status": "unavailable"}
     base, api_key = creds
     url = f"{base}/v1/turn/current"
     req = urllib.request.Request(
@@ -310,10 +310,25 @@ def fetch_broca_triggering_message(
         json.JSONDecodeError,
         OSError,
     ):
+        return {"active": False, "message": "", "status": "unavailable"}
+    if not isinstance(data, dict):
+        return {"active": False, "message": "", "status": "invalid"}
+    return {
+        "active": bool(data.get("active")),
+        "message": clean_user_query(str(data.get("message") or "")),
+        "status": str(data.get("status") or ""),
+        "queue_id": data.get("queue_id"),
+    }
+
+
+def fetch_broca_triggering_message(
+    agents_root: Path, agent_name: str
+) -> str:
+    """Compatibility wrapper returning only the current query."""
+    data = fetch_broca_current_turn(agents_root, agent_name)
+    if not data.get("active"):
         return ""
-    if not isinstance(data, dict) or not data.get("active"):
-        return ""
-    return clean_user_query(str(data.get("message") or ""))
+    return str(data.get("message") or "")
 
 
 def extract_user_query(rows: list[dict]) -> str:
@@ -573,6 +588,7 @@ def pick_run_id(
     *,
     since_epoch: float,
     seen_run_ids: set[str],
+    allow_old_active: bool = False,
 ) -> str | None:
     """Choose a fresh background run for this agent after turn start."""
     # Active first (scoped when API allows).
@@ -627,7 +643,7 @@ def pick_run_id(
         # turn — a prior finished run inside the wide floor must not steal the
         # pane (that showed the previous query while waiting).
         if status in ("running", "created"):
-            if created_epoch and created_epoch < floor:
+            if not allow_old_active and created_epoch and created_epoch < floor:
                 continue
             rank = 2
         elif status in ("completed", "succeeded"):
@@ -692,6 +708,10 @@ class TurnStreamWorker:
         self._cooldown_until: dict[str, float] = {}
         self._generation = 0
         self._pending_agents: list[str] = []
+        self._selected_agent: str | None = None
+        self._probe_thread: threading.Thread | None = None
+        self._probe_after = 0.0
+        self._seen_bridge_turns: set[tuple[str, object]] = set()
 
     def _gen_ok(self, gen: int) -> bool:
         with self._lock:
@@ -776,6 +796,7 @@ class TurnStreamWorker:
         never replace an in-progress focused turn.
         """
         now = now or time.time()
+        self._selected_agent = selected_agent
         by_agent: dict[str, str] = {}
         if broca_by_agent:
             by_agent.update(broca_by_agent)
@@ -828,6 +849,8 @@ class TurnStreamWorker:
             prev = self._prev_scroll.get(name)
             if prev is None:
                 self._prev_scroll[name] = new
+                if scrollback_signals_turn_start("", new, now=now):
+                    started.append(name)
                 continue
             self._prev_scroll[name] = new
             if scrollback_signals_turn_start(prev, new, now=now):
@@ -875,6 +898,10 @@ class TurnStreamWorker:
             self._start_seek(creds, since=now)
             return
 
+        # Recover turns already in progress when stop starts/reloads after the
+        # LIVE log edge. The HTTP probe runs off the UI thread.
+        self._probe_current_turn(selected_agent, now=now)
+
         for name in started:
             if name not in self._pending_agents:
                 self._pending_agents.append(name)
@@ -882,12 +909,61 @@ class TurnStreamWorker:
                     self.state.pending_agents = list(self._pending_agents)
                 self._notify()
 
-    def _start_seek(self, creds: LettaAgentCreds, *, since: float) -> None:
+    def _probe_current_turn(self, agent_name: str, *, now: float) -> None:
+        if now < self._probe_after:
+            return
+        if self._probe_thread is not None and self._probe_thread.is_alive():
+            return
+        self._probe_after = now + 1.5
+
+        def probe() -> None:
+            data = fetch_broca_current_turn(self.agents_root, agent_name)
+            if not data.get("active") or self._selected_agent != agent_name:
+                return
+            turn_key = (agent_name, data.get("queue_id") or data.get("message"))
+            with self._lock:
+                idle = (
+                    self.state.enabled
+                    and not self.state.active
+                    and self.state.status == "idle"
+                    and turn_key not in self._seen_bridge_turns
+                )
+                if idle:
+                    self._seen_bridge_turns.add(turn_key)
+                    if len(self._seen_bridge_turns) > 100:
+                        self._seen_bridge_turns = set(list(self._seen_bridge_turns)[-50:])
+            if not idle:
+                return
+            creds = load_agent_creds(self.agents_root, agent_name)
+            if creds is None:
+                self._set_error(agent_name, "no Letta creds for turn stream")
+                return
+            self._start_seek(
+                creds,
+                since=time.time(),
+                initial_query=str(data.get("message") or ""),
+                allow_old_active=True,
+            )
+
+        self._probe_thread = threading.Thread(
+            target=probe, name=f"stop-turn-probe-{agent_name}", daemon=True
+        )
+        self._probe_thread.start()
+
+    def _start_seek(
+        self,
+        creds: LettaAgentCreds,
+        *,
+        since: float,
+        initial_query: str = "",
+        allow_old_active: bool = False,
+    ) -> None:
         self._stop_event.clear()
-        # Console trap has no ask text — pull it from Otto bridge HTTP immediately
-        # so the waiting pane shows `> query` before the Letta run exists.
-        broca_q = fetch_broca_triggering_message(self.agents_root, creds.agent_name)
+        broca_q = clean_user_query(initial_query)
         with self._lock:
+            # A log edge and the recovery probe can land together.
+            if self.state.active or self.state.status != "idle":
+                return
             self._generation += 1
             gen = self._generation
             self.state.active = True
@@ -909,7 +985,23 @@ class TurnStreamWorker:
 
         def runner() -> None:
             try:
-                self._seek_and_stream(creds, since, gen)
+                if not broca_q:
+                    query = fetch_broca_triggering_message(
+                        self.agents_root, creds.agent_name
+                    )
+                    if query:
+                        self._set_query_and_waiting(
+                            query=query,
+                            run_id="",
+                            agent_name=creds.agent_name,
+                            gen=gen,
+                        )
+                self._seek_and_stream(
+                    creds,
+                    since,
+                    gen,
+                    allow_old_active=allow_old_active,
+                )
             except Exception as exc:  # noqa: BLE001
                 if not self._gen_ok(gen):
                     return
@@ -956,14 +1048,24 @@ class TurnStreamWorker:
             self._seen_run_order, maxlen=self.SEEN_RUNS_MAX
         )
 
-    def _seek_and_stream(self, creds: LettaAgentCreds, since: float, gen: int) -> None:
+    def _seek_and_stream(
+        self,
+        creds: LettaAgentCreds,
+        since: float,
+        gen: int,
+        *,
+        allow_old_active: bool = False,
+    ) -> None:
         deadline = since + self.SEEK_TIMEOUT_S
         run_id = None
         while time.time() < deadline and not self._stop_event.is_set():
             if not self._gen_ok(gen):
                 return
             run_id = pick_run_id(
-                creds, since_epoch=since, seen_run_ids=self._seen_runs
+                creds,
+                since_epoch=since,
+                seen_run_ids=self._seen_runs,
+                allow_old_active=allow_old_active,
             )
             if run_id:
                 break
