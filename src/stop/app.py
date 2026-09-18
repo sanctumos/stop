@@ -359,16 +359,16 @@ class WindowPane(Vertical):
         log = self.query_one("#turn-log", RichLog)
         want = bool(state.enabled and state.active and (state.text or state.error))
         revealing = want and not self._turn_visible
-        hiding = (not want) and self._turn_visible
         if want != self._turn_visible:
             panel.display = want
             self._turn_visible = want
             if not want:
                 self._turn_body = None
                 log.clear()
-            # Docked overlay should not resize #win-log; still nudge scroll-end
-            # after layout in case the terminal redraws the sibling pane.
-            if hiding or revealing:
+            # Docked overlay must not resize #win-log. On hide: leave the live
+            # log alone (no scroll_end — that itself looked like a view reset).
+            # On reveal: nudge scroll-end once after the overlay paints.
+            if revealing:
                 try:
                     win_log = self.query_one("#win-log", RichLog)
                     self.call_after_refresh(lambda: win_log.scroll_end(animate=False))
