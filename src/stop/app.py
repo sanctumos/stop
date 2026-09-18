@@ -286,10 +286,11 @@ class WindowPane(Vertical):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._feed = LiveLogFeed(limit=400, width=200)
-        self._turn_feed = LiveLogFeed(limit=300, width=200)
         self._agent: Agent | None = None
         self._win_index = 0
         self._turn_visible = False
+        self._turn_body: str | None = None
+        self._turn_paint_pending = False
 
     def compose(self) -> ComposeResult:
         yield Static(id="win-meta")
@@ -386,11 +387,12 @@ class WindowPane(Vertical):
         meta = self.query_one("#turn-meta", Static)
         log = self.query_one("#turn-log", RichLog)
         want = bool(state.enabled and state.active and (state.text or state.error))
+        revealing = want and not self._turn_visible
         if want != self._turn_visible:
             panel.display = want
             self._turn_visible = want
             if not want:
-                self._turn_feed.reset()
+                self._turn_body = None
                 log.clear()
         if not want:
             return
@@ -406,8 +408,39 @@ class WindowPane(Vertical):
         _set_title(panel, title)
         err = f"\n[error] {state.error}" if state.error else ""
         body = (state.text or "") + err
-        _paint(meta, f"[b]{state.status}[/b]  [dim]t toggle off[/dim]")
-        self._turn_feed.sync(log, body, source_key=f"turn:{state.run_id}:{state.status}")
+        nchars = len(body)
+        _paint(
+            meta,
+            f"[b]{state.status}[/b]  [dim]{nchars} chars · t toggles off[/dim]",
+        )
+        # Do not use LiveLogFeed here — its hardcopy noop/truncation guards can
+        # swallow the first paint while the panel is still size 0×0 after reveal.
+        if body != self._turn_body:
+            self._turn_body = body
+            if revealing or log.size.width <= 0:
+                self._turn_paint_pending = True
+                self.call_after_refresh(self._paint_turn_log)
+            else:
+                self._write_turn_log(log, body)
+
+    def _paint_turn_log(self) -> None:
+        if not self._turn_paint_pending:
+            return
+        self._turn_paint_pending = False
+        body = self._turn_body
+        if body is None or not self._turn_visible:
+            return
+        log = self.query_one("#turn-log", RichLog)
+        self._write_turn_log(log, body)
+
+    @staticmethod
+    def _write_turn_log(log: RichLog, body: str) -> None:
+        log.clear()
+        lines = (body or "").splitlines() or [body or ""]
+        # Cap paint volume; newest content at the end (auto_scroll).
+        for ln in lines[-300:]:
+            cleaned = "".join(ch if ch >= " " or ch in "\t" else "?" for ch in ln)
+            log.write(cleaned[:500], scroll_end=True)
 
 
 class ActiveNowPane(Vertical):
@@ -531,10 +564,9 @@ class StopApp(App[None]):
         height: 1fr; max-height: 50%;
         border: tall $success;
         padding: 0 1;
-        display: none;
     }
     #turn-meta { height: 1; }
-    #turn-log { height: 1fr; background: transparent; }
+    #turn-log { height: 1fr; background: transparent; min-height: 5; }
     #active {
         width: 1fr; height: 100%;
         border: round $warning;
@@ -610,7 +642,25 @@ class StopApp(App[None]):
         self._turn: TurnStreamWorker | None = None
         if isinstance(self.host, LiveHost):
             self.host.hardcopy_interval_s = float(self.config.refresh_hardcopy_s)
-            self._turn = TurnStreamWorker(agents_root=self.host.agents_root)
+            self._turn = TurnStreamWorker(
+                agents_root=self.host.agents_root,
+                on_update=self._on_turn_update,
+            )
+
+    def _on_turn_update(self) -> None:
+        """Worker thread → UI thread: repaint turn pane immediately."""
+        try:
+            self.call_from_thread(self._paint_turn_from_worker)
+        except Exception:
+            pass
+
+    def _paint_turn_from_worker(self) -> None:
+        if self._turn is None:
+            return
+        try:
+            self.query_one(WindowPane).show_turn(self._turn.snapshot())
+        except Exception:
+            pass
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)

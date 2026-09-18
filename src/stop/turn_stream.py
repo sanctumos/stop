@@ -95,8 +95,11 @@ def scrollback_signals_turn_start(prev: str, new: str) -> bool:
     """True when new Broca scrollback added a turn-start line."""
     if not (new or "").strip():
         return False
-    old_lines = (prev or "").splitlines()
-    new_lines = (new or "").splitlines()
+    # hardcopy can embed NULs / C1 controls — normalize before compare.
+    prev = (prev or "").replace("\x00", "")
+    new = (new or "").replace("\x00", "")
+    old_lines = prev.splitlines()
+    new_lines = new.splitlines()
     if new_lines == old_lines:
         return False
     if len(new_lines) >= len(old_lines) and new_lines[: len(old_lines)] == old_lines:
@@ -171,13 +174,30 @@ def _http_json(
 def list_runs_for_agent(
     creds: LettaAgentCreds, *, limit: int = 15
 ) -> list[dict]:
-    """Fetch recent runs; prefer agent-scoped if supported, else filter client-side."""
-    q = urllib.parse.urlencode({"limit": str(limit)})
+    """Fetch recent runs for this agent (server-side agent_id filter)."""
+    q = urllib.parse.urlencode(
+        {"limit": str(limit), "agent_id": creds.agent_id, "order": "desc"}
+    )
     url = f"{creds.endpoint}/v1/runs/?{q}"
     try:
         data = _http_json("GET", url, api_key=creds.api_key, timeout=8.0)
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError):
-        return []
+        # Fallback without agent_id if older Letta rejects the param.
+        try:
+            q2 = urllib.parse.urlencode({"limit": str(max(limit, 50))})
+            data = _http_json(
+                "GET",
+                f"{creds.endpoint}/v1/runs/?{q2}",
+                api_key=creds.api_key,
+                timeout=8.0,
+            )
+        except (
+            urllib.error.URLError,
+            urllib.error.HTTPError,
+            TimeoutError,
+            json.JSONDecodeError,
+        ):
+            return []
     rows: list
     if isinstance(data, list):
         rows = data
@@ -194,6 +214,30 @@ def list_runs_for_agent(
     return out
 
 
+def fetch_run_messages(creds: LettaAgentCreds, run_id: str) -> list[dict]:
+    """GET /v1/runs/{id}/messages — fallback when SSE yields nothing."""
+    url = f"{creds.endpoint}/v1/runs/{run_id}/messages?limit=100&order=asc"
+    try:
+        data = _http_json("GET", url, api_key=creds.api_key, timeout=12.0)
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError):
+        return []
+    if isinstance(data, list):
+        return [x for x in data if isinstance(x, dict)]
+    if isinstance(data, dict):
+        rows = data.get("messages") or data.get("data") or []
+        return [x for x in rows if isinstance(x, dict)]
+    return []
+
+
+def messages_to_text(rows: list[dict]) -> str:
+    parts: list[str] = []
+    for obj in rows:
+        piece = format_stream_event(obj)
+        if piece:
+            parts.append(piece)
+    return "\n\n".join(parts).strip()
+
+
 def pick_run_id(
     creds: LettaAgentCreds,
     *,
@@ -201,24 +245,40 @@ def pick_run_id(
     seen_run_ids: set[str],
 ) -> str | None:
     """Choose a fresh background run for this agent after turn start."""
-    # Active first.
+    # Active first (scoped when API allows).
+    active: object = []
     try:
+        q = urllib.parse.urlencode({"agent_id": creds.agent_id})
         active = _http_json(
             "GET",
-            f"{creds.endpoint}/v1/runs/active",
+            f"{creds.endpoint}/v1/runs/active?{q}",
             api_key=creds.api_key,
             timeout=5.0,
         )
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError):
-        active = []
+        try:
+            active = _http_json(
+                "GET",
+                f"{creds.endpoint}/v1/runs/active",
+                api_key=creds.api_key,
+                timeout=5.0,
+            )
+        except (
+            urllib.error.URLError,
+            urllib.error.HTTPError,
+            TimeoutError,
+            json.JSONDecodeError,
+        ):
+            active = []
     candidates: list[dict] = []
     if isinstance(active, list):
         candidates.extend(active)
-    candidates.extend(list_runs_for_agent(creds, limit=20))
+    candidates.extend(list_runs_for_agent(creds, limit=25))
 
     best: tuple[float, str] | None = None
-    # Accept runs created shortly before trap (clock skew / detect lag).
-    floor = since_epoch - 30.0
+    # Hardcopy lag + long turns: Broca trap can fire tens of seconds after
+    # created_at. Keep a wide floor so we still catch the run.
+    floor = since_epoch - 180.0
     for r in candidates:
         if not isinstance(r, dict):
             continue
@@ -443,6 +503,12 @@ class TurnStreamWorker:
             self.state.status = "streaming"
             self.state.text = f"Streaming {run_id}…\n"
         self._notify()
+        # Catch-up from messages API in case SSE is empty / already drained.
+        early = messages_to_text(fetch_run_messages(creds, run_id))
+        if early:
+            with self._lock:
+                self.state.text = early[-12000:]
+            self._notify()
         self._consume_stream(creds, run_id)
 
     def _consume_stream(self, creds: LettaAgentCreds, run_id: str) -> None:
@@ -461,6 +527,7 @@ class TurnStreamWorker:
             },
         )
         buf_lines: list[str] = []
+        stream_error = ""
         try:
             with urllib.request.urlopen(req, timeout=600) as resp:
                 while not self._stop_event.is_set():
@@ -501,19 +568,42 @@ class TurnStreamWorker:
                         self.state.status = "streaming"
                     self._notify()
         except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as exc:
+            stream_error = str(exc)[:200]
             with self._lock:
-                self.state.status = "error"
-                self.state.error = str(exc)[:200]
-                if not self.state.text.strip():
+                self.state.error = stream_error
+                if not self.state.text.strip() or self.state.text.startswith("Streaming "):
                     self.state.text = f"[stream error] {exc}"
             self._notify()
 
+        text_now = "\n".join(buf_lines).strip()
+        if len(text_now) < 40:
+            with self._lock:
+                prior = (self.state.text or "").strip()
+            if prior and not prior.startswith("Streaming ") and not prior.startswith(
+                "[stream error]"
+            ):
+                text_now = prior.replace("\n\n— turn complete —", "").strip()
+            if len(text_now) < 40:
+                # SSE missed content (attached too late / redis gap) — pull messages.
+                fallback = messages_to_text(fetch_run_messages(creds, run_id))
+                if fallback:
+                    text_now = fallback
+
         with self._lock:
-            self.state.status = "linger"
+            if text_now:
+                self.state.text = text_now[-12000:]
+            elif (self.state.text or "").startswith("Streaming "):
+                self.state.text = (
+                    f"No stream content for {run_id}."
+                    + (f" ({stream_error})" if stream_error else "")
+                )
+            final = (self.state.text or "").strip()
+            thin = len(final) < 40
+            self.state.status = "error" if (stream_error and thin) else "linger"
             self.state.lingering = True
             self.state.linger_until = time.time() + self.LINGER_S
-            if self.state.text.strip():
-                self.state.text = self.state.text.rstrip() + "\n\n— turn complete —"
+            if final and not final.endswith("— turn complete —"):
+                self.state.text = final + "\n\n— turn complete —"
         self._notify()
 
     def _notify(self) -> None:

@@ -125,3 +125,17 @@ def test_linger_expiry_clears(tmp_path: Path):
     assert snap.active is False
     assert snap.status == "idle"
     assert snap.text == ""
+
+
+def test_messages_to_text_formats_rows():
+    from stop.turn_stream import messages_to_text
+
+    text = messages_to_text(
+        [
+            {"message_type": "reasoning_message", "reasoning": "plan"},
+            {"message_type": "assistant_message", "content": "hello there"},
+            {"message_type": "stop_reason", "stop_reason": "end_turn"},
+        ]
+    )
+    assert "[think] plan" in text
+    assert "hello there" in text
