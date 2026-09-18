@@ -396,6 +396,70 @@ def messages_to_text(rows: list[dict]) -> str:
     return "\n\n".join(parts).strip()
 
 
+def message_identity(obj: dict) -> str:
+    """Stable id for merge arbitration (prefer server id, else content fingerprint)."""
+    mid = obj.get("id") or obj.get("message_id") or obj.get("ott_id")
+    if mid is not None and str(mid).strip():
+        return f"id:{mid}"
+    mtype = obj.get("message_type") or obj.get("type") or ""
+    piece = format_stream_event(obj)
+    return f"fp:{mtype}:{hash(piece)}"
+
+
+def ordered_unique_message_text(rows: list[dict]) -> str:
+    """Poll path: one text block per message identity, first-seen order."""
+    seen: set[str] = set()
+    parts: list[str] = []
+    for obj in rows:
+        if not isinstance(obj, dict):
+            continue
+        piece = format_stream_event(obj)
+        if not piece:
+            continue
+        key = message_identity(obj)
+        if key in seen:
+            continue
+        seen.add(key)
+        parts.append(piece)
+    return "\n\n".join(parts).strip()
+
+
+def merge_turn_bodies(*candidates: str) -> str:
+    """Pick the best non-placeholder body without moving text backward.
+
+    Prefer the longest candidate that extends (or equals) a shorter base.
+    Identical content wins; pure length wars without shared prefix keep the
+    longer string only when the shorter is a substring of the longer.
+    """
+    cleaned = [(c or "").strip() for c in candidates if (c or "").strip()]
+    if not cleaned:
+        return ""
+    best = cleaned[0]
+    for cand in cleaned[1:]:
+        if cand == best:
+            continue
+        if best.startswith(cand) or cand.startswith(best):
+            best = cand if len(cand) >= len(best) else best
+            continue
+        if best in cand:
+            best = cand
+            continue
+        if cand in best:
+            continue
+        # Disjoint: keep longer (poll usually wins completeness).
+        if len(cand) > len(best):
+            best = cand
+    return best
+
+
+def prune_seen_runs(order: list[str], *, maxlen: int = 100) -> tuple[list[str], set[str]]:
+    """Deterministic prune: keep the newest ``maxlen`` run ids."""
+    if len(order) <= maxlen:
+        return order, set(order)
+    kept = order[-maxlen:]
+    return kept, set(kept)
+
+
 def pick_run_id(
     creds: LettaAgentCreds,
     *,
@@ -492,6 +556,9 @@ class TurnStreamWorker:
     # After linger clears, ignore turn traps briefly — unstable hardcopy still
     # carries old LIVE-mode lines and was re-popping the query pane at rest.
     RETRIGGER_COOLDOWN_S = 12.0
+    SSE_READ_TIMEOUT_S = 45.0
+    SEEN_RUNS_MAX = 100
+    DISABLE_JOIN_S = 2.0
 
     def __init__(
         self,
@@ -504,18 +571,28 @@ class TurnStreamWorker:
         self._lock = threading.Lock()
         self.state = TurnStreamState()
         self._prev_scroll: dict[str, str] = {}
+        self._seen_run_order: list[str] = []
         self._seen_runs: set[str] = set()
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._seek_agent: str | None = None
         self._seek_since: float = 0.0
         self._cooldown_until: float = 0.0
+        self._generation = 0
+
+    def _gen_ok(self, gen: int) -> bool:
+        with self._lock:
+            return self.state.enabled and gen == self._generation
 
     def set_enabled(self, enabled: bool) -> None:
+        thread: threading.Thread | None = None
         with self._lock:
-            self.state.enabled = enabled
+            was = self.state.enabled
+            # Always bump generation so in-flight workers go stale.
+            self._generation += 1
             if not enabled:
                 self._stop_event.set()
+                self.state.enabled = False
                 self.state.active = False
                 self.state.lingering = False
                 self.state.status = "off"
@@ -525,6 +602,22 @@ class TurnStreamWorker:
                 self.state.error = ""
                 self.state.run_id = ""
                 self._seek_agent = None
+                thread = self._thread
+            else:
+                self._stop_event.clear()
+                self.state.enabled = True
+                if not was:
+                    self.state.active = False
+                    self.state.lingering = False
+                    self.state.status = "idle"
+                    self.state.text = ""
+                    self.state.query = ""
+                    self.state.saw_waiting_query = False
+                    self.state.error = ""
+                    self.state.run_id = ""
+                    self._seek_agent = None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=self.DISABLE_JOIN_S)
 
     def toggle(self) -> bool:
         with self._lock:
@@ -643,6 +736,8 @@ class TurnStreamWorker:
         # so the waiting pane shows `> query` before the Letta run exists.
         broca_q = fetch_broca_triggering_message(self.agents_root, creds.agent_name)
         with self._lock:
+            self._generation += 1
+            gen = self._generation
             self.state.active = True
             self.state.lingering = False
             self.state.agent_name = creds.agent_name
@@ -662,9 +757,13 @@ class TurnStreamWorker:
 
         def runner() -> None:
             try:
-                self._seek_and_stream(creds, since)
+                self._seek_and_stream(creds, since, gen)
             except Exception as exc:  # noqa: BLE001
+                if not self._gen_ok(gen):
+                    return
                 with self._lock:
+                    if gen != self._generation or not self.state.enabled:
+                        return
                     self.state.status = "error"
                     self.state.error = str(exc)[:200]
                     self.state.text = (self.state.text + f"\n[error] {exc}")[-8000:]
@@ -677,9 +776,15 @@ class TurnStreamWorker:
         )
         self._thread.start()
 
-    def _set_query_and_waiting(self, *, query: str, run_id: str, agent_name: str) -> None:
+    def _set_query_and_waiting(
+        self, *, query: str, run_id: str, agent_name: str, gen: int
+    ) -> None:
+        if not self._gen_ok(gen):
+            return
         q = (query or "").strip()
         with self._lock:
+            if gen != self._generation or not self.state.enabled:
+                return
             if q:
                 self.state.query = q
                 self.state.saw_waiting_query = True
@@ -691,20 +796,32 @@ class TurnStreamWorker:
             self.state.status = "streaming" if run_id else "seeking"
         self._notify()
 
-    def _seek_and_stream(self, creds: LettaAgentCreds, since: float) -> None:
+    def _remember_run(self, run_id: str) -> None:
+        if run_id in self._seen_runs:
+            return
+        self._seen_run_order.append(run_id)
+        self._seen_run_order, self._seen_runs = prune_seen_runs(
+            self._seen_run_order, maxlen=self.SEEN_RUNS_MAX
+        )
+
+    def _seek_and_stream(self, creds: LettaAgentCreds, since: float, gen: int) -> None:
         deadline = since + self.SEEK_TIMEOUT_S
         run_id = None
         while time.time() < deadline and not self._stop_event.is_set():
+            if not self._gen_ok(gen):
+                return
             run_id = pick_run_id(
                 creds, since_epoch=since, seen_run_ids=self._seen_runs
             )
             if run_id:
                 break
             time.sleep(0.6)
-        if self._stop_event.is_set():
+        if self._stop_event.is_set() or not self._gen_ok(gen):
             return
         if not run_id:
             with self._lock:
+                if gen != self._generation or not self.state.enabled:
+                    return
                 self.state.status = "error"
                 self.state.error = "no Letta run found"
                 self.state.text = "Turn detected but no Letta run appeared in time."
@@ -713,31 +830,32 @@ class TurnStreamWorker:
             self._notify()
             return
 
-        self._seen_runs.add(run_id)
-        # Bound memory of seen runs.
-        if len(self._seen_runs) > 200:
-            self._seen_runs = set(list(self._seen_runs)[-100:])
+        self._remember_run(run_id)
 
         with self._lock:
+            if gen != self._generation or not self.state.enabled:
+                return
             self.state.run_id = run_id
             self.state.status = "streaming"
         # Show run-id waiting chrome immediately, then poll hard for the
         # triggering user query *before* the first model step so the popup
         # isn't blank while Letta thinks.
         self._set_query_and_waiting(
-            query="", run_id=run_id, agent_name=creds.agent_name
+            query="", run_id=run_id, agent_name=creds.agent_name, gen=gen
         )
         query = ""
         early = ""
         wait_deadline = time.time() + 4.0
         while time.time() < wait_deadline and not self._stop_event.is_set():
+            if not self._gen_ok(gen):
+                return
             rows = fetch_run_messages(creds, run_id)
             q = extract_user_query(rows)
-            early = messages_to_text(rows)
+            early = ordered_unique_message_text(rows)
             if q and q != query:
                 query = q
                 self._set_query_and_waiting(
-                    query=query, run_id=run_id, agent_name=creds.agent_name
+                    query=query, run_id=run_id, agent_name=creds.agent_name, gen=gen
                 )
                 # Dwell so the popup paints the ask before step text replaces it
                 # (user_message and first step often arrive in the same poll).
@@ -746,7 +864,7 @@ class TurnStreamWorker:
             if query and early:
                 # Ensure at least one waiting+query frame before content.
                 self._set_query_and_waiting(
-                    query=query, run_id=run_id, agent_name=creds.agent_name
+                    query=query, run_id=run_id, agent_name=creds.agent_name, gen=gen
                 )
                 time.sleep(0.75)
                 break
@@ -758,14 +876,18 @@ class TurnStreamWorker:
             if query:
                 break
             time.sleep(0.1)
-        if early:
+        if early and self._gen_ok(gen):
             with self._lock:
+                if gen != self._generation or not self.state.enabled:
+                    return
                 q = self.state.query or query
                 self.state.text = with_query_header(early, q)[-12000:]
             self._notify()
-        self._consume_stream(creds, run_id)
+        self._consume_stream(creds, run_id, gen)
 
-    def _consume_stream(self, creds: LettaAgentCreds, run_id: str) -> None:
+    def _consume_stream(
+        self, creds: LettaAgentCreds, run_id: str, gen: int
+    ) -> None:
         url = f"{creds.endpoint}/v1/runs/{run_id}/stream"
         body = json.dumps(
             {"starting_after": 0, "include_pings": True, "poll_interval": 0.5}
@@ -783,6 +905,7 @@ class TurnStreamWorker:
         buf_lines: list[str] = []
         stream_error = ""
         poll_stop = threading.Event()
+        known_ids: set[str] = set()
 
         def _is_placeholder(cur: str) -> bool:
             c = (cur or "").strip()
@@ -802,16 +925,32 @@ class TurnStreamWorker:
             text = (text or "").strip()
             if not text:
                 return
+            if not self._gen_ok(gen):
+                return
             changed = False
             with self._lock:
+                if gen != self._generation or not self.state.enabled:
+                    return
                 cur = (self.state.text or "").strip()
                 q = self.state.query
                 display = with_query_header(text, q)
-                if _is_placeholder(cur) or len(display) >= len(cur):
+                if _is_placeholder(cur):
                     if display != self.state.text:
                         self.state.text = display[-12000:]
                         self.state.status = "streaming"
                         changed = True
+                else:
+                    merged = merge_turn_bodies(cur, display)
+                    # Never move backward to a shorter unrelated body.
+                    if merged != cur and (
+                        len(merged) >= len(cur)
+                        or _is_placeholder(cur)
+                        or cur in merged
+                    ):
+                        if merged != self.state.text:
+                            self.state.text = merged[-12000:]
+                            self.state.status = "streaming"
+                            changed = True
             if changed:
                 self._notify()
 
@@ -819,13 +958,20 @@ class TurnStreamWorker:
             """SSE is step-batched and blocks on readline — poll messages so UI
             updates as soon as a step lands, not only when the socket unblocks."""
             while not poll_stop.is_set() and not self._stop_event.is_set():
+                if not self._gen_ok(gen):
+                    return
                 try:
                     rows = fetch_run_messages(creds, run_id)
                     q = extract_user_query(rows)
-                    msg_text = messages_to_text(rows)
+                    msg_text = ordered_unique_message_text(rows)
+                    for obj in rows:
+                        if isinstance(obj, dict):
+                            known_ids.add(message_identity(obj))
                     have_steps = bool(msg_text)
                     if q:
                         with self._lock:
+                            if gen != self._generation or not self.state.enabled:
+                                return
                             if not self.state.query:
                                 self.state.query = q
                             need_waiting = not self.state.saw_waiting_query
@@ -835,6 +981,7 @@ class TurnStreamWorker:
                                 query=q,
                                 run_id=run_id,
                                 agent_name=creds.agent_name,
+                                gen=gen,
                             )
                             if have_steps:
                                 time.sleep(0.5)
@@ -854,50 +1001,83 @@ class TurnStreamWorker:
             target=_poll_messages, name=f"turn-poll-{run_id[-8:]}", daemon=True
         )
         poller.start()
+        stream_done = False
         try:
-            with urllib.request.urlopen(req, timeout=600) as resp:
-                while not self._stop_event.is_set():
-                    raw = resp.readline()
-                    if not raw:
+            # Bounded socket wait; reconnect loop covers long turns.
+            while (
+                not stream_done
+                and not self._stop_event.is_set()
+                and self._gen_ok(gen)
+            ):
+                try:
+                    with urllib.request.urlopen(
+                        req, timeout=self.SSE_READ_TIMEOUT_S
+                    ) as resp:
+                        while not self._stop_event.is_set() and self._gen_ok(gen):
+                            raw = resp.readline()
+                            if not raw:
+                                stream_done = True
+                                break
+                            line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+                            if not line or line.startswith(":"):
+                                continue
+                            if not line.startswith("data:"):
+                                continue
+                            payload = line[5:].strip()
+                            if payload == "[DONE]":
+                                stream_done = True
+                                break
+                            try:
+                                obj = json.loads(payload)
+                            except json.JSONDecodeError:
+                                continue
+                            if not isinstance(obj, dict):
+                                continue
+                            mid = message_identity(obj)
+                            piece = format_stream_event(obj)
+                            if not piece:
+                                continue
+                            # Poll already delivered this message — skip SSE echo.
+                            if mid in known_ids and mid.startswith("id:"):
+                                continue
+                            known_ids.add(mid)
+                            if piece.startswith("[think]") or piece.startswith("[tool"):
+                                buf_lines.append(piece)
+                                buf_lines.append("")
+                            else:
+                                if buf_lines and not buf_lines[-1].startswith("["):
+                                    buf_lines[-1] = buf_lines[-1] + piece
+                                else:
+                                    buf_lines.append(piece)
+                            _apply_text("\n".join(buf_lines))
+                except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as exc:
+                    stream_error = str(exc)[:200]
+                    if self._stop_event.is_set() or not self._gen_ok(gen):
                         break
-                    line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
-                    if not line:
+                    # Soft timeout: reconnect if still live.
+                    if "timed out" in stream_error.lower() or isinstance(
+                        exc, TimeoutError
+                    ):
+                        time.sleep(0.3)
                         continue
-                    if line.startswith(":"):
-                        continue  # comment / ping
-                    if not line.startswith("data:"):
-                        continue
-                    payload = line[5:].strip()
-                    if payload == "[DONE]":
-                        break
-                    try:
-                        obj = json.loads(payload)
-                    except json.JSONDecodeError:
-                        continue
-                    if not isinstance(obj, dict):
-                        continue
-                    piece = format_stream_event(obj)
-                    if not piece:
-                        continue
-                    # Step chunks: full reasoning/tool blocks as paragraphs.
-                    if piece.startswith("[think]") or piece.startswith("[tool"):
-                        buf_lines.append(piece)
-                        buf_lines.append("")
-                    else:
-                        if buf_lines and not buf_lines[-1].startswith("["):
-                            buf_lines[-1] = buf_lines[-1] + piece
-                        else:
-                            buf_lines.append(piece)
-                    _apply_text("\n".join(buf_lines))
-        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as exc:
-            stream_error = str(exc)[:200]
-            with self._lock:
-                self.state.error = stream_error
-                if not self.state.text.strip() or _is_placeholder(self.state.text):
-                    self.state.text = f"[stream error] {exc}"
-            self._notify()
+                    with self._lock:
+                        if gen != self._generation or not self.state.enabled:
+                            break
+                        self.state.error = stream_error
+                        if not self.state.text.strip() or _is_placeholder(self.state.text):
+                            self.state.text = f"[stream error] {exc}"
+                    self._notify()
+                    break
         finally:
             poll_stop.set()
+            try:
+                poller.join(timeout=1.0)
+            except Exception:
+                pass
+
+        if not self._gen_ok(gen):
+            # Disabled / superseded — do not enter linger.
+            return
 
         text_now = "\n".join(buf_lines).strip()
         if len(text_now) < 40:
@@ -913,14 +1093,20 @@ class TurnStreamWorker:
                 rows = fetch_run_messages(creds, run_id)
                 if not q:
                     q = extract_user_query(rows)
-                fallback = messages_to_text(rows)
+                fallback = ordered_unique_message_text(rows)
                 if fallback:
                     text_now = fallback
 
         with self._lock:
+            if gen != self._generation or not self.state.enabled:
+                return
             q = self.state.query
             if text_now:
-                self.state.text = with_query_header(text_now, q)[-12000:]
+                merged = merge_turn_bodies(
+                    self.state.text.replace("\n\n— turn complete —", "").strip(),
+                    with_query_header(text_now, q),
+                )
+                self.state.text = merged[-12000:]
             elif _is_placeholder(self.state.text or ""):
                 self.state.text = (
                     f"No stream content for {run_id}."
