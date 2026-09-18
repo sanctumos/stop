@@ -180,7 +180,7 @@ class HostStrip(Static):
         """btop-style continuum bar (█ / ░) — avoid ■ which fonts draw as diamonds."""
         pct = max(0.0, min(100.0, pct))
         filled = int(round((pct / 100.0) * width))
-        return "█" * filled + "░" * (width - filled)
+        return "█" * filled + "─" * (width - filled)
 
     @staticmethod
     def _rate(bps: float) -> str:

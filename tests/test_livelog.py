@@ -15,6 +15,10 @@ def test_clean_log_line_strips_rich_level_diamonds():
     assert "|" in clean_log_line(mangled)
 
 
+def test_diff_noop():
+    assert diff_log_lines(["a", "b"], ["a", "b"]) == ("noop", [])
+
+
 def test_diff_pure_append():
     assert diff_log_lines(["a"], ["a", "b", "c"]) == ("append", ["b", "c"])
 
