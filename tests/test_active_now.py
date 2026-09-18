@@ -37,6 +37,8 @@ def test_bridge_write_is_noise():
         )
         == KIND_NOISE
     )
+    assert classify_line("Retrieved 0 inbox messages") == KIND_NOISE
+    assert classify_line("Retrieved 2 partner-bridge messages") != KIND_NOISE
 
 
 def test_telegram_inbound_is_dialogue():
