@@ -1,4 +1,8 @@
-"""Per-agent activity sparklines, normalized to each agent's own volume."""
+"""Per-agent activity bars.
+
+Empty inbox polls stay dark. A real line lights the bar, and an open Letta
+turn stays lit while she is thinking even if the log goes quiet.
+"""
 
 from __future__ import annotations
 
