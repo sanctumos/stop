@@ -153,6 +153,21 @@ def test_linger_ignores_new_turn_signals(tmp_path: Path):
     assert "waiting for Letta run" not in snap.text
 
 
+def test_empty_hardcopy_does_not_reset_cursor(tmp_path: Path):
+    """Empty hardcopy must not arm first-paint skip on the next full capture."""
+    w = TurnStreamWorker(agents_root=tmp_path)
+    prev = "idle\n"
+    w.tick(selected_agent="athena", broca_scrollback=prev)
+    w.tick(selected_agent="athena", broca_scrollback="")  # race
+    w.tick(
+        selected_agent="athena",
+        broca_scrollback=prev + "Processing message in LIVE mode\n",
+    )
+    snap = w.snapshot()
+    assert snap.active is True
+    assert snap.status in ("seeking", "error")
+
+
 def test_linger_expiry_clears(tmp_path: Path):
     w = TurnStreamWorker(agents_root=tmp_path)
     now = time.time()

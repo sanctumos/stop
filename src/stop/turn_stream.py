@@ -403,8 +403,8 @@ class TurnStreamWorker:
                 self.state.agent_name = ""
             # Advance scroll cursor so lagging Broca lines (POST 200, detach)
             # that arrived during linger do not look like a fresh turn start.
-            if selected_agent:
-                self._prev_scroll[selected_agent] = broca_scrollback or ""
+            if selected_agent and (broca_scrollback or "").strip():
+                self._prev_scroll[selected_agent] = broca_scrollback
             self._notify()
             return
 
@@ -414,19 +414,28 @@ class TurnStreamWorker:
             or status in ("streaming", "seeking", "linger", "error")
             or (self._thread and self._thread.is_alive())
         ):
-            if selected_agent:
-                self._prev_scroll[selected_agent] = broca_scrollback or ""
+            # Only advance cursor on real scrollback — empty hardcopy races
+            # must not wipe prev (that makes the next full capture look like
+            # first-paint and we miss the next turn forever).
+            if selected_agent and (broca_scrollback or "").strip():
+                self._prev_scroll[selected_agent] = broca_scrollback
             return
 
         if not selected_agent:
             return
 
-        prev = self._prev_scroll.get(selected_agent, "")
         new = broca_scrollback or ""
-        self._prev_scroll[selected_agent] = new
-        if not prev:
-            # First paint — don't treat full history as a new turn.
+        if not new.strip():
+            # Transient empty hardcopy — keep cursor, do not arm first-paint.
             return
+
+        prev = self._prev_scroll.get(selected_agent)
+        if prev is None:
+            # First real paint — don't treat full history as a new turn.
+            self._prev_scroll[selected_agent] = new
+            return
+
+        self._prev_scroll[selected_agent] = new
         if not scrollback_signals_turn_start(prev, new):
             return
 
