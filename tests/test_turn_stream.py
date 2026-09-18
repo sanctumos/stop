@@ -200,3 +200,33 @@ def test_messages_to_text_formats_rows():
     )
     assert "[think] plan" in text
     assert "hello there" in text
+
+
+def test_clean_and_extract_user_query():
+    from stop.turn_stream import (
+        clean_user_query,
+        extract_user_query,
+        waiting_panel_text,
+        with_query_header,
+    )
+
+    raw = (
+        "[Username: @AskDoctorBitcoin, Telegram ID: 1] "
+        "hey can you check the meters?"
+    )
+    assert clean_user_query(raw) == "hey can you check the meters?"
+    q = extract_user_query(
+        [
+            {
+                "message_type": "user_message",
+                "content": "[Username: @otto, Otto_Bridge ID: otto] ping please",
+            },
+            {"message_type": "assistant_message", "content": "pong"},
+        ]
+    )
+    assert q == "ping please"
+    wait = waiting_panel_text(agent_name="athena", run_id="run-abc", query=q)
+    assert wait.startswith("> ping please")
+    assert "waiting for first model step" in wait
+    body = with_query_header("[think] hmm\nOK", q)
+    assert body.startswith("> ping please\n\n[think]")

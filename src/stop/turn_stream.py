@@ -52,6 +52,7 @@ class TurnStreamState:
     run_id: str = ""
     status: str = "idle"  # idle | seeking | streaming | linger | error
     text: str = ""
+    query: str = ""  # triggering user message, shown while waiting / as header
     error: str = ""
     started_at: float = 0.0
     linger_until: float = 0.0
@@ -114,7 +115,7 @@ def scrollback_signals_turn_start(prev: str, new: str) -> bool:
 def format_stream_event(obj: dict) -> str:
     """Reduce a Letta SSE JSON object to display text."""
     mtype = obj.get("message_type") or obj.get("type") or ""
-    if mtype in ("ping", "keepalive"):
+    if mtype in ("ping", "keepalive", "user_message", "system_message"):
         return ""
     if mtype == "reasoning_message":
         reasoning = (obj.get("reasoning") or "").strip()
@@ -145,6 +146,81 @@ def format_stream_event(obj: dict) -> str:
     if "content" in obj and isinstance(obj["content"], str) and obj["content"]:
         return obj["content"]
     return ""
+
+
+_USER_META_PREFIX_RE = re.compile(
+    r"^\[(?:Username|Telegram|Otto_Bridge|Platform|sender)[^\]]*\]\s*",
+    re.I,
+)
+
+
+def clean_user_query(content: str) -> str:
+    """Strip Broca/Letta envelope prefixes from a user_message body."""
+    text = (content or "").strip()
+    if not text:
+        return ""
+    # Unwrap list-shaped content defensively.
+    while True:
+        m = _USER_META_PREFIX_RE.match(text)
+        if not m:
+            break
+        text = text[m.end() :].lstrip()
+    return text.strip()
+
+
+def extract_user_query(rows: list[dict]) -> str:
+    """First user_message content from a run messages list."""
+    for obj in rows:
+        if not isinstance(obj, dict):
+            continue
+        mtype = obj.get("message_type") or obj.get("type") or ""
+        if mtype != "user_message":
+            continue
+        content = obj.get("content")
+        if isinstance(content, list):
+            bits = []
+            for part in content:
+                if isinstance(part, dict) and part.get("text"):
+                    bits.append(str(part["text"]))
+                elif isinstance(part, str):
+                    bits.append(part)
+            content = "".join(bits)
+        text = clean_user_query(str(content or obj.get("message") or ""))
+        if text:
+            return text
+    return ""
+
+
+def waiting_panel_text(*, agent_name: str, run_id: str = "", query: str = "") -> str:
+    """Body shown before the first assistant/reasoning step arrives."""
+    q = (query or "").strip()
+    if run_id:
+        wait = (
+            f"Live on {run_id}…\n"
+            "(step stream — waiting for first model step)"
+        )
+    else:
+        wait = f"Turn started — waiting for Letta run ({agent_name})…"
+    if q:
+        # Keep query readable; cap very long pastes.
+        shown = q if len(q) <= 2000 else q[:2000] + "…"
+        return f"> {shown}\n\n{wait}"
+    return wait
+
+
+def with_query_header(body: str, query: str) -> str:
+    """Prefix stream/linger body with the triggering user query."""
+    q = (query or "").strip()
+    body = (body or "").rstrip()
+    if not q:
+        return body
+    shown = q if len(q) <= 2000 else q[:2000] + "…"
+    header = f"> {shown}"
+    if body.startswith(header):
+        return body
+    if not body:
+        return header
+    return f"{header}\n\n{body}"
 
 
 def _http_json(
@@ -349,6 +425,7 @@ class TurnStreamWorker:
                 self.state.lingering = False
                 self.state.status = "off"
                 self.state.text = ""
+                self.state.query = ""
                 self.state.error = ""
                 self.state.run_id = ""
                 self._seek_agent = None
@@ -370,6 +447,7 @@ class TurnStreamWorker:
                 run_id=s.run_id,
                 status=s.status,
                 text=s.text,
+                query=s.query,
                 error=s.error,
                 started_at=s.started_at,
                 linger_until=s.linger_until,
@@ -399,6 +477,7 @@ class TurnStreamWorker:
                 self.state.active = False
                 self.state.status = "idle"
                 self.state.text = ""
+                self.state.query = ""
                 self.state.run_id = ""
                 self.state.agent_name = ""
             # Advance scroll cursor so lagging Broca lines (POST 200, detach)
@@ -460,8 +539,9 @@ class TurnStreamWorker:
             self.state.lingering = False
             self.state.agent_name = creds.agent_name
             self.state.run_id = ""
+            self.state.query = ""
             self.state.status = "seeking"
-            self.state.text = f"Turn started — waiting for Letta run ({creds.agent_name})…"
+            self.state.text = waiting_panel_text(agent_name=creds.agent_name)
             self.state.error = ""
             self.state.started_at = since
             self.state.linger_until = 0.0
@@ -485,6 +565,19 @@ class TurnStreamWorker:
             target=runner, name=f"turn-stream-{creds.agent_name}", daemon=True
         )
         self._thread.start()
+
+    def _set_query_and_waiting(self, *, query: str, run_id: str, agent_name: str) -> None:
+        q = (query or "").strip()
+        with self._lock:
+            if q:
+                self.state.query = q
+            self.state.text = waiting_panel_text(
+                agent_name=agent_name,
+                run_id=run_id,
+                query=self.state.query,
+            )
+            self.state.status = "streaming" if run_id else "seeking"
+        self._notify()
 
     def _seek_and_stream(self, creds: LettaAgentCreds, since: float) -> None:
         deadline = since + self.SEEK_TIMEOUT_S
@@ -516,16 +609,17 @@ class TurnStreamWorker:
         with self._lock:
             self.state.run_id = run_id
             self.state.status = "streaming"
-            self.state.text = (
-                f"Live on {run_id}…\n"
-                "(step stream — text appears when each model step finishes, not per-token)\n"
-            )
-        self._notify()
-        # Catch-up from messages API in case SSE is empty / already drained.
-        early = messages_to_text(fetch_run_messages(creds, run_id))
+        # Prefer showing the user query ASAP (often present before any step).
+        rows = fetch_run_messages(creds, run_id)
+        query = extract_user_query(rows)
+        self._set_query_and_waiting(
+            query=query, run_id=run_id, agent_name=creds.agent_name
+        )
+        early = messages_to_text(rows)
         if early:
             with self._lock:
-                self.state.text = early[-12000:]
+                q = self.state.query
+                self.state.text = with_query_header(early, q)[-12000:]
             self._notify()
         self._consume_stream(creds, run_id)
 
@@ -548,15 +642,34 @@ class TurnStreamWorker:
         stream_error = ""
         poll_stop = threading.Event()
 
+        def _is_placeholder(cur: str) -> bool:
+            c = (cur or "").strip()
+            if c.startswith(("Streaming ", "Live on ", "Turn started")):
+                return True
+            if "waiting for first model step" in c.lower():
+                return True
+            if c.startswith(">") and (
+                "Live on " in c
+                or "Turn started" in c
+                or "waiting for" in c.lower()
+            ):
+                return True
+            return False
+
         def _apply_text(text: str) -> None:
             text = (text or "").strip()
             if not text:
                 return
             with self._lock:
                 cur = (self.state.text or "").strip()
-                placeholder = cur.startswith("Streaming ") or cur.startswith("Live on ")
-                if placeholder or len(text) >= len(cur):
-                    self.state.text = text[-12000:]
+                q = self.state.query
+                # Capture query if poll only has user_message so far.
+                if not q:
+                    # messages_to_text skips user_message; poller may pass raw rows via side path
+                    pass
+                display = with_query_header(text, q)
+                if _is_placeholder(cur) or len(display) >= len(cur):
+                    self.state.text = display[-12000:]
                     self.state.status = "streaming"
             self._notify()
 
@@ -565,9 +678,28 @@ class TurnStreamWorker:
             updates as soon as a step lands, not only when the socket unblocks."""
             while not poll_stop.is_set() and not self._stop_event.is_set():
                 try:
-                    msg_text = messages_to_text(fetch_run_messages(creds, run_id))
-                    if msg_text:
-                        _apply_text(msg_text)
+                    rows = fetch_run_messages(creds, run_id)
+                    q = extract_user_query(rows)
+                    if q:
+                        with self._lock:
+                            if not self.state.query:
+                                self.state.query = q
+                        # If still waiting on first step, refresh waiting body with query.
+                        with self._lock:
+                            cur = self.state.text
+                            have_steps = bool(messages_to_text(rows))
+                        if not have_steps:
+                            self._set_query_and_waiting(
+                                query=q,
+                                run_id=run_id,
+                                agent_name=creds.agent_name,
+                            )
+                        else:
+                            _apply_text(messages_to_text(rows))
+                    else:
+                        msg_text = messages_to_text(rows)
+                        if msg_text:
+                            _apply_text(msg_text)
                 except Exception:
                     pass
                 poll_stop.wait(0.7)
@@ -615,9 +747,7 @@ class TurnStreamWorker:
             stream_error = str(exc)[:200]
             with self._lock:
                 self.state.error = stream_error
-                if not self.state.text.strip() or self.state.text.startswith(
-                    ("Streaming ", "Live on ")
-                ):
+                if not self.state.text.strip() or _is_placeholder(self.state.text):
                     self.state.text = f"[stream error] {exc}"
             self._notify()
         finally:
@@ -627,20 +757,25 @@ class TurnStreamWorker:
         if len(text_now) < 40:
             with self._lock:
                 prior = (self.state.text or "").strip()
-            if prior and not prior.startswith(("Streaming ", "Live on ")) and not prior.startswith(
+                q = self.state.query
+            if prior and not _is_placeholder(prior) and not prior.startswith(
                 "[stream error]"
             ):
+                # Strip header for length check reuse
                 text_now = prior.replace("\n\n— turn complete —", "").strip()
             if len(text_now) < 40:
-                # SSE missed content (attached too late / redis gap) — pull messages.
-                fallback = messages_to_text(fetch_run_messages(creds, run_id))
+                rows = fetch_run_messages(creds, run_id)
+                if not q:
+                    q = extract_user_query(rows)
+                fallback = messages_to_text(rows)
                 if fallback:
                     text_now = fallback
 
         with self._lock:
+            q = self.state.query
             if text_now:
-                self.state.text = text_now[-12000:]
-            elif (self.state.text or "").startswith(("Streaming ", "Live on ")):
+                self.state.text = with_query_header(text_now, q)[-12000:]
+            elif _is_placeholder(self.state.text or ""):
                 self.state.text = (
                     f"No stream content for {run_id}."
                     + (f" ({stream_error})" if stream_error else "")
