@@ -490,6 +490,7 @@ class TurnStreamWorker:
                 self.state.status = "idle"
                 self.state.text = ""
                 self.state.query = ""
+                self.state.saw_waiting_query = False
                 self.state.run_id = ""
                 self.state.agent_name = ""
             # Advance scroll cursor so lagging Broca lines (POST 200, detach)
@@ -645,14 +646,18 @@ class TurnStreamWorker:
                 # (user_message and first step often arrive in the same poll).
                 if not early:
                     time.sleep(0.15)
-            if early:
-                if query:
-                    # Ensure at least one waiting+query frame before content.
-                    self._set_query_and_waiting(
-                        query=query, run_id=run_id, agent_name=creds.agent_name
-                    )
-                    time.sleep(0.75)
+            if query and early:
+                # Ensure at least one waiting+query frame before content.
+                self._set_query_and_waiting(
+                    query=query, run_id=run_id, agent_name=creds.agent_name
+                )
+                time.sleep(0.75)
                 break
+            if early and not query:
+                # Steps landed before user_message is visible — keep polling
+                # briefly for the ask so the waiting pane can still show it.
+                time.sleep(0.1)
+                continue
             if query:
                 break
             time.sleep(0.1)
@@ -720,26 +725,26 @@ class TurnStreamWorker:
                 try:
                     rows = fetch_run_messages(creds, run_id)
                     q = extract_user_query(rows)
+                    msg_text = messages_to_text(rows)
+                    have_steps = bool(msg_text)
                     if q:
                         with self._lock:
                             if not self.state.query:
                                 self.state.query = q
-                        # If still waiting on first step, refresh waiting body with query.
-                        with self._lock:
+                            need_waiting = not self.state.saw_waiting_query
                             cur = self.state.text
-                            have_steps = bool(messages_to_text(rows))
-                        if not have_steps:
+                        if need_waiting and (not have_steps or _is_placeholder(cur)):
                             self._set_query_and_waiting(
                                 query=q,
                                 run_id=run_id,
                                 agent_name=creds.agent_name,
                             )
-                        else:
-                            _apply_text(messages_to_text(rows))
-                    else:
-                        msg_text = messages_to_text(rows)
-                        if msg_text:
+                            if have_steps:
+                                time.sleep(0.5)
+                        if have_steps:
                             _apply_text(msg_text)
+                    elif msg_text:
+                        _apply_text(msg_text)
                 except Exception:
                     pass
                 # Faster while still waiting so the query header lands before
