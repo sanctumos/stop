@@ -205,11 +205,22 @@ class AgentList(Static):
         self.agents: list[Agent] = []
         self.index = 0
         self.filter = ""
+        # Authoritative selection — index is derived (#4067).
+        self.selected_name: str | None = None
+        self._fell_back = False
 
     def set_agents(self, agents: list[Agent]) -> None:
+        from .selection import resolve_agent_selection
+
         self.agents = agents
-        if self.index >= len(self.visible()):
-            self.index = max(0, len(self.visible()) - 1)
+        vis = self.visible()
+        idx, name, fell = resolve_agent_selection(
+            vis, selected_name=self.selected_name
+        )
+        self.index = idx
+        if name != self.selected_name and fell:
+            self._fell_back = True
+        self.selected_name = name
         self.refresh_view()
 
     def visible(self) -> list[Agent]:
@@ -222,19 +233,34 @@ class AgentList(Static):
         vis = self.visible()
         if not vis:
             return None
-        return vis[self.index]
+        if self.selected_name:
+            for a in vis:
+                if a.name == self.selected_name:
+                    return a
+        if 0 <= self.index < len(vis):
+            return vis[self.index]
+        return vis[0]
 
     def move(self, delta: int) -> None:
         vis = self.visible()
         if not vis:
             return
         self.index = (self.index + delta) % len(vis)
+        self.selected_name = vis[self.index].name
+        self._fell_back = False
         self.refresh_view()
 
     def refresh_view(self) -> None:
         now = time.time()
+        # Keep index aligned with selected_name for the highlight marker.
+        vis = self.visible()
+        if self.selected_name and vis:
+            for i, a in enumerate(vis):
+                if a.name == self.selected_name:
+                    self.index = i
+                    break
         lines = []
-        for i, a in enumerate(self.visible()):
+        for i, a in enumerate(vis):
             mark = ">" if i == self.index else " "
             style = _state_style(a.state)
             badge = short_badge(a.state)
@@ -263,9 +289,11 @@ class WindowPane(Vertical):
         self._turn_feed = LiveLogFeed(limit=400, width=500)
         self._agent: Agent | None = None
         self._win_index = 0
+        self._selected_window_id: str | None = None
         self._turn_visible = False
         self._turn_body: str | None = None
         self._empty_kind: str | None = None  # none|select|empty — avoid repeat clears
+        self._window_fell_back = False
 
     def compose(self) -> ComposeResult:
         yield Static(id="win-meta")
@@ -299,9 +327,16 @@ class WindowPane(Vertical):
             return ""
         return f" · bridge in={w.bridge_inbox_count} out={w.bridge_outbox_count or 0}"
 
-    def show_agent(self, agent: Agent | None, win_index: int = 0) -> None:
+    def show_agent(
+        self,
+        agent: Agent | None,
+        win_index: int = 0,
+        *,
+        window_id: str | None = None,
+    ) -> None:
+        from .selection import resolve_window_selection
+
         self._agent = agent
-        self._win_index = win_index
         meta = self.query_one("#win-meta", Static)
         log = self.query_one("#win-log", RichLog)
 
@@ -324,7 +359,20 @@ class WindowPane(Vertical):
             return
 
         self._empty_kind = None
-        w = agent.windows[win_index % len(agent.windows)]
+        want_id = window_id if window_id is not None else self._selected_window_id
+        idx, resolved_id, fell = resolve_window_selection(
+            agent.windows, selected_window_id=want_id
+        )
+        # Prefer explicit win_index only when no identity is set yet.
+        if want_id is None and 0 <= win_index < len(agent.windows):
+            idx = win_index
+            resolved_id = agent.windows[idx].id
+            fell = False
+        self._win_index = idx
+        if fell and resolved_id != self._selected_window_id:
+            self._window_fell_back = True
+        self._selected_window_id = resolved_id
+        w = agent.windows[idx]
         broca = next(
             (x for x in agent.windows if (x.screen_name or "").startswith("broca-")),
             None,
@@ -343,7 +391,7 @@ class WindowPane(Vertical):
             _set_title(self, f"{agent.name} windows{bit} — Enter to expand")
             lines: list[str] = []
             for i, win in enumerate(agent.windows):
-                mark = ">" if i == win_index else " "
+                mark = ">" if i == idx else " "
                 style = _state_style(win.state)
                 pid = f" pid={win.last_seen_pid}" if win.last_seen_pid else ""
                 miss = ""
@@ -651,6 +699,7 @@ class StopApp(App[None]):
         self._filter = ""
         self._snap: HostSnapshot | None = None
         self._win_index = 0
+        self.selected_window_id: str | None = None
         self._narrow_page = "agents"
         self._errors = 0
         self._painted_rev = -1
@@ -835,7 +884,21 @@ class StopApp(App[None]):
             agents_w.filter = self._filter
             agents_w.set_agents(snap.agents)
             selected = agents_w.selected()
-            self.query_one(WindowPane).show_agent(selected, self._win_index)
+            pane = self.query_one(WindowPane)
+            # Carry window identity across inventory churn (#4067).
+            pane._selected_window_id = self.selected_window_id
+            pane.show_agent(selected, window_id=self.selected_window_id)
+            self._win_index = pane._win_index
+            self.selected_window_id = pane._selected_window_id
+            notes: list[str] = []
+            if agents_w._fell_back:
+                agents_w._fell_back = False
+                if agents_w.selected_name:
+                    notes.append(f"selection → {agents_w.selected_name}")
+            if pane._window_fell_back:
+                pane._window_fell_back = False
+                if self.selected_window_id:
+                    notes.append(f"window → {self.selected_window_id}")
             active = pick_active_now(
                 snap.agents,
                 follow_lock_id=self.follow_lock_id,
@@ -850,6 +913,10 @@ class StopApp(App[None]):
             if err:
                 self.query_one(EventStrip).update(
                     f"[red]refresh error: {_plain(err[:80])}[/red]"
+                )
+            elif notes:
+                self.query_one(EventStrip).update(
+                    f"[yellow]{_plain('; '.join(notes))}[/yellow]"
                 )
             else:
                 self.query_one(EventStrip).show(snap)
@@ -902,11 +969,15 @@ class StopApp(App[None]):
         if pane.expanded and self.query_one(AgentList).selected():
             agent = self.query_one(AgentList).selected()
             if agent and agent.windows:
-                self._win_index = (self._win_index + 1) % len(agent.windows)
-                pane.show_agent(agent, self._win_index)
+                idx = (pane._win_index + 1) % len(agent.windows)
+                wid = agent.windows[idx].id
+                self._win_index = idx
+                self.selected_window_id = wid
+                pane.show_agent(agent, window_id=wid)
                 return
         self.query_one(AgentList).move(1)
         self._win_index = 0
+        self.selected_window_id = None  # re-resolve on new agent
         self._sync_windows()
         self.refresh_host()
 
@@ -915,11 +986,15 @@ class StopApp(App[None]):
         if pane.expanded and self.query_one(AgentList).selected():
             agent = self.query_one(AgentList).selected()
             if agent and agent.windows:
-                self._win_index = (self._win_index - 1) % len(agent.windows)
-                pane.show_agent(agent, self._win_index)
+                idx = (pane._win_index - 1) % len(agent.windows)
+                wid = agent.windows[idx].id
+                self._win_index = idx
+                self.selected_window_id = wid
+                pane.show_agent(agent, window_id=wid)
                 return
         self.query_one(AgentList).move(-1)
         self._win_index = 0
+        self.selected_window_id = None
         self._sync_windows()
         self.refresh_host()
 
@@ -927,7 +1002,12 @@ class StopApp(App[None]):
         if self._snap is None:
             return
         agents_w = self.query_one(AgentList)
-        self.query_one(WindowPane).show_agent(agents_w.selected(), self._win_index)
+        pane = self.query_one(WindowPane)
+        pane.show_agent(
+            agents_w.selected(), window_id=self.selected_window_id
+        )
+        self._win_index = pane._win_index
+        self.selected_window_id = pane._selected_window_id
 
     def action_expand(self) -> None:
         filt = self.query_one("#filter", Input)
