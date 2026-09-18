@@ -196,3 +196,11 @@ def test_selection_identity_fields_exist_on_window():
     ids = [w.id for a in snap.agents for w in a.windows]
     assert len(ids) == len(set(ids))
     assert any(i.endswith("/broca") for i in ids)
+
+
+def test_no_sqlite_in_turn_stream_source():
+    """#4069: stop must not open Broca production databases."""
+    src = Path(__file__).resolve().parents[1] / "src" / "stop" / "turn_stream.py"
+    text = src.read_text(encoding="utf-8")
+    assert "import sqlite3" not in text
+    assert "sqlite3.connect" not in text

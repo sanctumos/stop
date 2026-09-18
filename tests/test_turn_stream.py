@@ -257,47 +257,82 @@ def test_clean_and_extract_user_query():
     assert body.startswith("> ping please\n\n[think]")
 
 
-def test_fetch_broca_triggering_message_from_queue(tmp_path: Path):
-    """LIVE-mode trap reads the ask from Broca sanctum.db, not console logs."""
-    import sqlite3
+def test_fetch_broca_triggering_message_via_http(tmp_path: Path):
+    """LIVE-mode trap reads the ask from Otto bridge HTTP, not sanctum.db."""
+    import json
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import threading
 
     from stop.turn_stream import fetch_broca_triggering_message
 
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            if self.path != "/v1/turn/current":
+                self.send_response(404)
+                self.end_headers()
+                return
+            body = json.dumps(
+                {
+                    "active": True,
+                    "message": "[Username: @x] TRIGGER_FROM_HTTP please",
+                    "status": "processing",
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_a):  # noqa: ANN002
+            return
+
+    srv = HTTPServer(("127.0.0.1", 0), H)
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
     broca = tmp_path / "athena" / "broca"
     broca.mkdir(parents=True)
-    db = broca / "sanctum.db"
-    con = sqlite3.connect(db)
-    con.executescript(
-        """
-        CREATE TABLE messages (
-          id INTEGER PRIMARY KEY,
-          letta_user_id INTEGER,
-          platform_profile_id INTEGER,
-          role TEXT,
-          message TEXT,
-          timestamp TEXT,
-          processed INTEGER,
-          agent_response TEXT
-        );
-        CREATE TABLE queue (
-          id INTEGER PRIMARY KEY,
-          letta_user_id INTEGER,
-          message_id INTEGER,
-          status TEXT,
-          attempts INTEGER,
-          timestamp TEXT
-        );
-        INSERT INTO messages (id, role, message, processed)
-          VALUES (10, 'user', 'old ask', 1);
-        INSERT INTO messages (id, role, message, processed)
-          VALUES (11, 'user', 'TRIGGER_FROM_BROCA_DB please', 0);
-        INSERT INTO queue (id, message_id, status)
-          VALUES (100, 10, 'completed');
-        INSERT INTO queue (id, message_id, status)
-          VALUES (101, 11, 'processing');
-        """
+    (broca / ".env").write_text(
+        f"OTTO_BRIDGE_HTTP_LISTEN=127.0.0.1:{port}\n"
+        "OTTO_BRIDGE_HTTP_API_KEY=testkey\n",
+        encoding="utf-8",
     )
-    con.commit()
-    con.close()
-    q = fetch_broca_triggering_message(tmp_path, "athena")
-    assert q == "TRIGGER_FROM_BROCA_DB please"
+    try:
+        q = fetch_broca_triggering_message(tmp_path, "athena")
+        assert q == "TRIGGER_FROM_HTTP please"
+    finally:
+        srv.shutdown()
+
+
+def test_background_agent_turn_does_not_replace_focused(tmp_path: Path):
+    w = TurnStreamWorker(agents_root=tmp_path)
+    w.tick(
+        selected_agent="ada",
+        broca_by_agent={"ada": "idle\n", "rico": "idle\n"},
+    )
+    # Focused ada is seeking/erroring (no creds).
+    w.tick(
+        selected_agent="ada",
+        broca_by_agent={
+            "ada": "idle\nProcessing message in LIVE mode\n",
+            "rico": "idle\n",
+        },
+    )
+    assert w.snapshot().status in ("seeking", "error")
+    assert w.snapshot().agent_name == "ada"
+    # While busy, rico turn becomes pending badge only.
+    with w._lock:
+        w.state.status = "streaming"
+        w.state.active = True
+        w.state.agent_name = "ada"
+    w.tick(
+        selected_agent="ada",
+        broca_by_agent={
+            "ada": "idle\nProcessing message in LIVE mode\nmore\n",
+            "rico": "idle\nProcessing message in LIVE mode\n",
+        },
+    )
+    snap = w.snapshot()
+    assert snap.agent_name == "ada"
+    assert "rico" in snap.pending_agents

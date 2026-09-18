@@ -41,8 +41,8 @@ python3 -m venv .venv && .venv/bin/pip install -e .[dev]
   `hardcopy`. Scratch lives in `/tmp/stop-<uid>/`.
 - Architecture: three lanes (collection / state / render) — see
   [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). Widgets must not do host I/O.
-- Turn ask text currently may read Broca `sanctum.db` read-only (temporary);
-  rebuild #4069 moves that to published HTTP APIs only.
+- Turn ask text uses published Otto bridge HTTP ``GET /v1/turn/current``
+  (never opens Broca ``sanctum.db`` from stop).
 - No restart buttons. Crashed windows go red and `stop` waits for the cron
   supervisor to bring them back.
 - Never destroy the shared `stop` screen (see above).

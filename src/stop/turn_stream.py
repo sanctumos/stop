@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import re
-import sqlite3
 import threading
 import time
 import urllib.error
@@ -58,7 +57,8 @@ class TurnStreamState:
     error: str = ""
     started_at: float = 0.0
     linger_until: float = 0.0
-
+    # Background agents that signaled a turn while another turn is focused (#4069).
+    pending_agents: list[str] = field(default_factory=list)
 
 def load_agent_creds(agents_root: Path, agent_name: str) -> LettaAgentCreds | None:
     """Read AGENT_ID / AGENT_API_KEY / AGENT_ENDPOINT from agents/<name>/broca/.env."""
@@ -180,74 +180,72 @@ def clean_user_query(content: str) -> str:
     return text.strip()
 
 
-def broca_db_path(agents_root: Path, agent_name: str) -> Path | None:
-    """Path to agents/<name>/broca/sanctum.db when present."""
-    p = agents_root / agent_name / "broca" / "sanctum.db"
-    return p if p.is_file() else None
+def broca_http_creds(agents_root: Path, agent_name: str) -> tuple[str, str] | None:
+    """Return (base_url, api_key) for this agent's Otto bridge HTTP listener."""
+    env_path = agents_root / agent_name / "broca" / ".env"
+    if not env_path.is_file():
+        env_path = agents_root / agent_name / ".env"
+    if not env_path.is_file():
+        return None
+    vals: dict[str, str] = {}
+    try:
+        for line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            s = line.strip()
+            if not s or s.startswith("#") or "=" not in s:
+                continue
+            k, _, v = s.partition("=")
+            vals[k.strip()] = v.strip().strip("'").strip('"')
+    except OSError:
+        return None
+    listen = (vals.get("OTTO_BRIDGE_HTTP_LISTEN") or "").strip()
+    key = (vals.get("OTTO_BRIDGE_HTTP_API_KEY") or "").strip()
+    if not listen or not key:
+        return None
+    if "://" in listen:
+        base = listen.rstrip("/")
+    else:
+        host, _, port = listen.rpartition(":")
+        host = host.strip() or "127.0.0.1"
+        base = f"http://{host}:{port.strip()}"
+    return base, key
 
 
 def fetch_broca_triggering_message(
     agents_root: Path, agent_name: str
 ) -> str:
-    """Read the user message that triggered the current Broca turn.
+    """Fetch the user message that triggered the current Broca turn via HTTP.
 
-    Console hardcopy only shows LIVE-mode lines — not the ask text. The ask
-    lives in Broca's ``messages`` table (joined via ``queue`` while processing).
-    Read-only. Prefer in-flight queue rows, else the latest user message.
+    Uses ``GET {OTTO_BRIDGE_HTTP_LISTEN}/v1/turn/current`` (published Broca Otto
+    bridge API). Never opens the Broca SQLite database from stop (#4069).
     """
-    db = broca_db_path(agents_root, agent_name)
-    if db is None:
+    creds = broca_http_creds(agents_root, agent_name)
+    if creds is None:
         return ""
+    base, api_key = creds
+    url = f"{base}/v1/turn/current"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "application/json",
+        },
+        method="GET",
+    )
     try:
-        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2.0)
-    except sqlite3.Error:
+        with urllib.request.urlopen(req, timeout=3.0) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+        data = json.loads(raw) if raw.strip() else {}
+    except (
+        urllib.error.URLError,
+        urllib.error.HTTPError,
+        TimeoutError,
+        json.JSONDecodeError,
+        OSError,
+    ):
         return ""
-    try:
-        # In-flight turn: queue row → messages.message
-        row = con.execute(
-            """
-            SELECT m.message
-            FROM queue q
-            JOIN messages m ON m.id = q.message_id
-            WHERE q.status IN ('processing', 'pending', 'queued')
-              AND m.role = 'user'
-              AND IFNULL(m.message, '') != ''
-            ORDER BY q.id DESC
-            LIMIT 1
-            """
-        ).fetchone()
-        if row and (row[0] or "").strip():
-            return clean_user_query(str(row[0]))
-        # Just-completed race: Broca may mark completed before our trap paints.
-        # Take the newest user message from the last few seconds of queue work.
-        row = con.execute(
-            """
-            SELECT m.message
-            FROM queue q
-            JOIN messages m ON m.id = q.message_id
-            WHERE m.role = 'user'
-              AND IFNULL(m.message, '') != ''
-            ORDER BY q.id DESC
-            LIMIT 1
-            """
-        ).fetchone()
-        if row and (row[0] or "").strip():
-            return clean_user_query(str(row[0]))
-        row = con.execute(
-            """
-            SELECT message FROM messages
-            WHERE role = 'user' AND IFNULL(message, '') != ''
-            ORDER BY id DESC
-            LIMIT 1
-            """
-        ).fetchone()
-        if row and (row[0] or "").strip():
-            return clean_user_query(str(row[0]))
-    except sqlite3.Error:
+    if not isinstance(data, dict) or not data.get("active"):
         return ""
-    finally:
-        con.close()
-    return ""
+    return clean_user_query(str(data.get("message") or ""))
 
 
 def extract_user_query(rows: list[dict]) -> str:
@@ -577,8 +575,9 @@ class TurnStreamWorker:
         self._stop_event = threading.Event()
         self._seek_agent: str | None = None
         self._seek_since: float = 0.0
-        self._cooldown_until: float = 0.0
+        self._cooldown_until: dict[str, float] = {}
         self._generation = 0
+        self._pending_agents: list[str] = []
 
     def _gen_ok(self, gen: int) -> bool:
         with self._lock:
@@ -601,7 +600,9 @@ class TurnStreamWorker:
                 self.state.saw_waiting_query = False
                 self.state.error = ""
                 self.state.run_id = ""
+                self.state.pending_agents = []
                 self._seek_agent = None
+                self._pending_agents = []
                 thread = self._thread
             else:
                 self._stop_event.clear()
@@ -615,7 +616,9 @@ class TurnStreamWorker:
                     self.state.saw_waiting_query = False
                     self.state.error = ""
                     self.state.run_id = ""
+                    self.state.pending_agents = []
                     self._seek_agent = None
+                    self._pending_agents = []
         if thread is not None and thread.is_alive():
             thread.join(timeout=self.DISABLE_JOIN_S)
 
@@ -641,17 +644,30 @@ class TurnStreamWorker:
                 error=s.error,
                 started_at=s.started_at,
                 linger_until=s.linger_until,
+                pending_agents=list(self._pending_agents),
             )
 
     def tick(
         self,
         *,
         selected_agent: str | None,
-        broca_scrollback: str,
+        broca_scrollback: str = "",
+        broca_by_agent: dict[str, str] | None = None,
         now: float | None = None,
     ) -> None:
-        """Called each host refresh from the UI thread."""
+        """Observe Broca scrollbacks; seek only for the selected agent (#4069).
+
+        ``broca_by_agent`` supplies independent cursors for every eligible Broca
+        window. Background turn starts become ``pending_agents`` badges and
+        never replace an in-progress focused turn.
+        """
         now = now or time.time()
+        by_agent: dict[str, str] = {}
+        if broca_by_agent:
+            by_agent.update(broca_by_agent)
+        if selected_agent is not None and selected_agent not in by_agent:
+            by_agent[selected_agent] = broca_scrollback or ""
+
         with self._lock:
             enabled = self.state.enabled
             lingering = self.state.lingering
@@ -671,64 +687,86 @@ class TurnStreamWorker:
                 self.state.saw_waiting_query = False
                 self.state.run_id = ""
                 self.state.agent_name = ""
-                self._cooldown_until = now + self.RETRIGGER_COOLDOWN_S
-            # Advance scroll cursor so lagging Broca lines (POST 200, detach)
-            # that arrived during linger do not look like a fresh turn start.
-            if selected_agent and (broca_scrollback or "").strip():
-                self._prev_scroll[selected_agent] = broca_scrollback
+            if selected_agent:
+                self._cooldown_until[selected_agent] = (
+                    now + self.RETRIGGER_COOLDOWN_S
+                )
+            for name, text in by_agent.items():
+                if (text or "").strip():
+                    self._prev_scroll[name] = text
             self._notify()
             return
 
-        # Busy on a turn (including linger/error hold) — never re-trap.
-        if (
+        busy = (
             lingering
             or status in ("streaming", "seeking", "linger", "error")
             or (self._thread and self._thread.is_alive())
-        ):
-            # Only advance cursor on real scrollback — empty hardcopy races
-            # must not wipe prev (that makes the next full capture look like
-            # first-paint and we miss the next turn forever).
-            if selected_agent and (broca_scrollback or "").strip():
-                self._prev_scroll[selected_agent] = broca_scrollback
+        )
+
+        # Advance cursors / detect starts for every agent independently.
+        started: list[str] = []
+        for name, new in sorted(by_agent.items()):
+            if not (new or "").strip():
+                continue
+            if now < self._cooldown_until.get(name, 0.0):
+                self._prev_scroll[name] = new
+                continue
+            prev = self._prev_scroll.get(name)
+            if prev is None:
+                self._prev_scroll[name] = new
+                continue
+            self._prev_scroll[name] = new
+            if scrollback_signals_turn_start(prev, new):
+                started.append(name)
+
+        if busy:
+            # Queue background starts; never interrupt the focused turn.
+            changed = False
+            for name in started:
+                if name == selected_agent:
+                    continue
+                if name not in self._pending_agents:
+                    self._pending_agents.append(name)
+                    changed = True
+            if changed:
+                with self._lock:
+                    self.state.pending_agents = list(self._pending_agents)
+                self._notify()
             return
 
         if not selected_agent:
+            # Still record pending badges when nothing is selected.
+            for name in started:
+                if name not in self._pending_agents:
+                    self._pending_agents.append(name)
             return
 
-        if now < self._cooldown_until:
-            # Still advance cursor so cooldown exit doesn't see a giant delta.
-            if (broca_scrollback or "").strip():
-                self._prev_scroll[selected_agent] = broca_scrollback
+        # Prefer selected agent's start; else leave others as pending.
+        if selected_agent in started:
+            for name in started:
+                if name != selected_agent and name not in self._pending_agents:
+                    self._pending_agents.append(name)
+            creds = load_agent_creds(self.agents_root, selected_agent)
+            if creds is None:
+                with self._lock:
+                    self.state.status = "error"
+                    self.state.error = f"no Letta creds for {selected_agent}"
+                    self.state.active = True
+                    self.state.agent_name = selected_agent
+                    self.state.linger_until = now + 8.0
+                    self.state.lingering = True
+                    self.state.pending_agents = list(self._pending_agents)
+                self._notify()
+                return
+            self._start_seek(creds, since=now)
             return
 
-        new = broca_scrollback or ""
-        if not new.strip():
-            # Transient empty hardcopy — keep cursor, do not arm first-paint.
-            return
-
-        prev = self._prev_scroll.get(selected_agent)
-        if prev is None:
-            # First real paint — don't treat full history as a new turn.
-            self._prev_scroll[selected_agent] = new
-            return
-
-        self._prev_scroll[selected_agent] = new
-        if not scrollback_signals_turn_start(prev, new):
-            return
-
-        creds = load_agent_creds(self.agents_root, selected_agent)
-        if creds is None:
-            with self._lock:
-                self.state.status = "error"
-                self.state.error = f"no Letta creds for {selected_agent}"
-                self.state.active = True
-                self.state.agent_name = selected_agent
-                self.state.linger_until = now + 8.0
-                self.state.lingering = True
-            self._notify()
-            return
-
-        self._start_seek(creds, since=now)
+        for name in started:
+            if name not in self._pending_agents:
+                self._pending_agents.append(name)
+                with self._lock:
+                    self.state.pending_agents = list(self._pending_agents)
+                self._notify()
 
     def _start_seek(self, creds: LettaAgentCreds, *, since: float) -> None:
         self._stop_event.clear()

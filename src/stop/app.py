@@ -581,12 +581,13 @@ class LettaPane(Vertical):
 
 
 class EventStrip(Static):
-    def show(self, snap: HostSnapshot) -> None:
-        if not snap.events:
-            _paint(self, "events: (none)")
-            return
-        bits = [_plain(e.message) for e in snap.events[-5:]]
-        _paint(self, "events: " + " · ".join(bits))
+    def show(self, snap: HostSnapshot, *, turn_hint: str = "") -> None:
+        parts: list[str] = []
+        if turn_hint:
+            parts.append(_plain(turn_hint))
+        if snap.events:
+            parts.extend(_plain(e.message) for e in snap.events[-4:])
+        _paint(self, "events: " + (" · ".join(parts) if parts else "(none)"))
 
 
 class StopApp(App[None]):
@@ -924,7 +925,18 @@ class StopApp(App[None]):
                     f"[yellow]{_plain('; '.join(notes))}[/yellow]"
                 )
             else:
-                self.query_one(EventStrip).show(snap)
+                turn_hint = ""
+                if self._turn is not None:
+                    st = self._turn.snapshot()
+                    bits: list[str] = []
+                    if st.active and st.agent_name:
+                        bits.append(f"turn:{st.agent_name}")
+                    if st.pending_agents:
+                        bits.append(
+                            "pending:" + ",".join(st.pending_agents[:3])
+                        )
+                    turn_hint = " ".join(bits)
+                self.query_one(EventStrip).show(snap, turn_hint=turn_hint)
             self._errors = 0
             METRICS.bump_render_revision()
             if METRICS.snapshot_count and METRICS.snapshot_count % 30 == 0:
@@ -949,14 +961,24 @@ class StopApp(App[None]):
     def _tick_turn_stream(self, selected: Agent | None) -> None:
         if self._turn is None:
             return
-        broca_text = ""
+        by_agent: dict[str, str] = {}
+        if self._snap is not None:
+            for agent in self._snap.agents:
+                for w in agent.windows:
+                    if (w.screen_name or "").startswith("broca-"):
+                        by_agent[agent.name] = w.last_scrollback or ""
+                        break
         name = selected.name if selected else None
-        if selected:
+        if selected and name not in by_agent:
             for w in selected.windows:
                 if (w.screen_name or "").startswith("broca-"):
-                    broca_text = w.last_scrollback or ""
+                    by_agent[name] = w.last_scrollback or ""
                     break
-        self._turn.tick(selected_agent=name, broca_scrollback=broca_text)
+        self._turn.tick(
+            selected_agent=name,
+            broca_by_agent=by_agent,
+            broca_scrollback=by_agent.get(name or "", ""),
+        )
         self.query_one(WindowPane).show_turn(self._turn.snapshot())
 
     def action_toggle_turn_stream(self) -> None:
