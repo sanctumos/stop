@@ -53,6 +53,7 @@ class TurnStreamState:
     status: str = "idle"  # idle | seeking | streaming | linger | error
     text: str = ""
     query: str = ""  # triggering user message, shown while waiting / as header
+    saw_waiting_query: bool = False  # True once waiting pane showed `> query`
     error: str = ""
     started_at: float = 0.0
     linger_until: float = 0.0
@@ -435,6 +436,7 @@ class TurnStreamWorker:
                 self.state.status = "off"
                 self.state.text = ""
                 self.state.query = ""
+                self.state.saw_waiting_query = False
                 self.state.error = ""
                 self.state.run_id = ""
                 self._seek_agent = None
@@ -457,6 +459,7 @@ class TurnStreamWorker:
                 status=s.status,
                 text=s.text,
                 query=s.query,
+                saw_waiting_query=s.saw_waiting_query,
                 error=s.error,
                 started_at=s.started_at,
                 linger_until=s.linger_until,
@@ -549,6 +552,7 @@ class TurnStreamWorker:
             self.state.agent_name = creds.agent_name
             self.state.run_id = ""
             self.state.query = ""
+            self.state.saw_waiting_query = False
             self.state.status = "seeking"
             self.state.text = waiting_panel_text(agent_name=creds.agent_name)
             self.state.error = ""
@@ -580,6 +584,7 @@ class TurnStreamWorker:
         with self._lock:
             if q:
                 self.state.query = q
+                self.state.saw_waiting_query = True
             self.state.text = waiting_panel_text(
                 agent_name=agent_name,
                 run_id=run_id,
@@ -646,7 +651,7 @@ class TurnStreamWorker:
                     self._set_query_and_waiting(
                         query=query, run_id=run_id, agent_name=creds.agent_name
                     )
-                    time.sleep(0.45)
+                    time.sleep(0.75)
                 break
             if query:
                 break
