@@ -13,6 +13,8 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Footer, Header, Input, RichLog, Static
 
+from .host_meters import HostMeters
+
 from .activity import follow_lock_still_present, pick_active_now
 from .collector import HostCollector
 from .config import StopConfig, apply_agent_order, load_config
@@ -158,51 +160,15 @@ class HelpScreen(ModalScreen[None]):
 
 
 class HostStrip(Static):
-    """Host meters: continuum bars + rates (no block-glyph sparklines)."""
+    """CPU, load, RAM, swap, and network. Glyphs are the tty1 console font."""
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-
-    @staticmethod
-    def _bar(pct: float, width: int = 14) -> str:
-        """Filled █ + empty ─ (shade/block grit reads as diamonds in many fonts)."""
-        pct = max(0.0, min(100.0, pct))
-        filled = int(round((pct / 100.0) * width))
-        return "█" * filled + "─" * (width - filled)
-
-    @staticmethod
-    def _rate(bps: float) -> str:
-        if bps < 1024:
-            return f"{bps:6.0f} B/s  "
-        if bps < 1024 * 1024:
-            return f"{bps / 1024:6.1f} KiB/s"
-        return f"{bps / (1024 * 1024):6.2f} MiB/s"
-
-    @staticmethod
-    def _pressure_style(pct: float) -> str:
-        return "green" if pct < 70 else ("yellow" if pct < 90 else "red")
+        self._meters = HostMeters()
 
     def show(self, snap: HostSnapshot) -> None:
-        load = snap.load_avg
-        mem_pct = snap.mem_percent
-        if mem_pct <= 0 and snap.mem_total_gib > 0:
-            mem_pct = 100.0 * snap.mem_used_gib / snap.mem_total_gib
-
-        cpu_style = self._pressure_style(snap.cpu_percent)
-        ram_style = self._pressure_style(mem_pct)
-
-        line1 = (
-            f"[b]CPU[/b] [{cpu_style}]{self._bar(snap.cpu_percent)}[/{cpu_style}] "
-            f"{snap.cpu_percent:5.1f}%  "
-            f"load [b]{load[0]:.2f}[/b] {load[1]:.2f} {load[2]:.2f}"
-        )
-        line2 = (
-            f"[b]RAM[/b] [{ram_style}]{self._bar(mem_pct)}[/{ram_style}] "
-            f"{snap.mem_used_gib:4.1f}/{snap.mem_total_gib:.1f}G {mem_pct:3.0f}%  "
-            f"[b]NET[/b] [cyan]↑{self._rate(snap.net_up_bps)}[/cyan] "
-            f"[magenta]↓{self._rate(snap.net_down_bps)}[/magenta]"
-        )
-        _paint(self, line1 + "\n" + line2)
+        width = self.size.width if self.size.width else 80
+        _paint(self, self._meters.render(snap, width=width))
 
 
 class AgentList(Static):
@@ -621,7 +587,7 @@ class StopApp(App[None]):
     SUB_TITLE = "SanctumOS-top"
     CSS = """
     Screen { layout: vertical; }
-    #host { height: 2; background: $boost; padding: 0 1; }
+    #host { height: 3; background: $boost; padding: 0 1; }
     #events { height: 1; color: $text-muted; padding: 0 1; }
     #body { height: 1fr; }
     #row { height: 2fr; }

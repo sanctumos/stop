@@ -499,6 +499,7 @@ class LiveHost(HostBackend):
         # Never block the UI thread with interval>0.
         cpu = psutil.cpu_percent(interval=None)
         load = os.getloadavg() if hasattr(os, "getloadavg") else (0.0, 0.0, 0.0)
+        swap = psutil.swap_memory()
         snap = HostSnapshot(
             agents=agents,
             screens=screens,
@@ -513,6 +514,10 @@ class LiveHost(HostBackend):
             net_up_bps=up_bps,
             net_down_bps=down_bps,
             pulses=self._pulse.observe(agents, now),
+            swap_used_gib=swap.used / (1024**3),
+            swap_total_gib=swap.total / (1024**3),
+            swap_percent=float(swap.percent),
+            cpu_count=os.cpu_count() or 1,
         )
         METRICS.record_snapshot(time.perf_counter() - t0)
         return snap

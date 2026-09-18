@@ -111,3 +111,8 @@ class HostSnapshot:
     net_up_bps: float = 0.0
     net_down_bps: float = 0.0
     pulses: dict[str, str] = field(default_factory=dict)
+    swap_used_gib: float = 0.0
+    swap_total_gib: float = 0.0
+    swap_percent: float = 0.0
+    # Logical CPUs. Load bars are relative to this, not to 1.0.
+    cpu_count: int = 1
