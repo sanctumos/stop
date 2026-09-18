@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Callable
 
 from .livelog import unwrap_screen_hardcopy
+from .telemetry import trace
 
 # Broca console lines that mean a Letta turn just began.
 # Keep this tight: httpx "POST …/messages 200" logs when the request *finishes*
@@ -636,7 +637,7 @@ def pick_run_id(
     """
     now_epoch = now_epoch or time.time()
     has_query = bool(normalized_query(recovery_query))
-    # Active first (scoped when API allows).
+    http_error = ""
     active: object = []
     try:
         q = urllib.parse.urlencode({"agent_id": creds.agent_id})
@@ -646,7 +647,8 @@ def pick_run_id(
             api_key=creds.api_key,
             timeout=20.0,
         )
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError):
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as exc:
+        http_error = type(exc).__name__
         try:
             active = _http_json(
                 "GET",
@@ -654,81 +656,113 @@ def pick_run_id(
                 api_key=creds.api_key,
                 timeout=20.0,
             )
+            http_error = ""
         except (
             urllib.error.URLError,
             urllib.error.HTTPError,
             TimeoutError,
             json.JSONDecodeError,
-        ):
+        ) as exc2:
+            http_error = type(exc2).__name__
             active = []
     candidates: list[dict] = []
     if isinstance(active, list):
         candidates.extend(active)
-    candidates.extend(list_runs_for_agent(creds, limit=25))
+    listed = list_runs_for_agent(creds, limit=25)
+    candidates.extend(listed)
 
     considered: set[str] = set()
-    # 3 minutes covers a turn we noticed late. With the Broca text, also
-    # reach back across a reload (max_recovery_age_s). Without it, a
-    # finished run is only eligible for 8 seconds — long enough to catch
-    # a run that just completed, short enough to ignore the previous turn.
     tight_floor = since_epoch - 180.0
     wide_floor = now_epoch - max_recovery_age_s
     live_floor = min(tight_floor, wide_floor) if has_query else tight_floor
     completed_floor = wide_floor if has_query else since_epoch - 8.0
     scored: list[tuple[float, str, bool]] = []
+    counts = {
+        "old": 0,
+        "other_agent": 0,
+        "seen": 0,
+        "foreground": 0,
+        "status": 0,
+        "query": 0,
+    }
+    near: list[dict] = []
+
+    def _note(why: str, rid: str, created_epoch: float = 0.0, **extra: object) -> None:
+        counts[why] = counts.get(why, 0) + 1
+        # Zombies and already-seen rows are counts only. Near misses are
+        # the rows that could have been this turn.
+        if why in ("old", "other_agent", "seen") or len(near) >= 8:
+            return
+        age = None
+        if created_epoch:
+            age = int((now_epoch - created_epoch) // 30) * 30
+        row: dict = {"id": (rid or "")[-12:], "why": why, "age_s": age}
+        row.update(extra)
+        near.append(row)
+
     for r in candidates:
         if not isinstance(r, dict):
             continue
         if r.get("agent_id") != creds.agent_id:
+            _note("other_agent", str(r.get("id") or ""))
             continue
         rid = r.get("id") or ""
         if not rid or rid in seen_run_ids or rid in considered:
+            _note("seen", str(rid))
             continue
         considered.add(rid)
-        # Prefer background runs (required for /stream observer).
-        if r.get("background") is False:
-            continue
-        created = r.get("created_at") or ""
-        created_epoch = _parse_iso(created)
+        created_epoch = _parse_iso(r.get("created_at") or "")
         status = (r.get("status") or "").lower()
-        # Prefer in-flight runs. Completed runs are catch-up only for *this*
-        # turn — a prior finished run inside the wide floor must not steal the
-        # pane (that showed the previous query while waiting).
+        if r.get("background") is False:
+            _note("foreground", rid, created_epoch, status=status)
+            continue
         if status in ("running", "created"):
             if not created_epoch or created_epoch < live_floor:
+                _note("old", rid, created_epoch, status=status)
                 continue
             rank = 2
         elif status in ("completed", "succeeded"):
             if not created_epoch or created_epoch < completed_floor:
+                _note("old", rid, created_epoch, status=status)
                 continue
             rank = 1
         else:
+            _note("status", rid, created_epoch, status=status or "?")
             continue
         matched = False
         if has_query:
             matched = run_query_matches(
                 fetch_run_messages(creds, rid), recovery_query
             )
-            # Finished runs must be this turn. An in-flight run older than
-            # the normal window (reload recovery) must match too. A run we
-            # just noticed may not have stored its user message yet — keep
-            # it, and prefer a match when one exists.
             if status in ("completed", "succeeded") and not matched:
+                _note("query", rid, created_epoch, status=status)
                 continue
             if (
                 status in ("running", "created")
                 and created_epoch < tight_floor
                 and not matched
             ):
+                _note("query", rid, created_epoch, status=status)
                 continue
         score = rank * 1e12 + (created_epoch or 0.0)
         scored.append((score, rid, matched))
-    if has_query and any(matched for _, _, matched in scored):
+    if has_query and any(row[2] for row in scored):
         scored = [row for row in scored if row[2]]
-    if not scored:
-        return None
     scored.sort(reverse=True)
-    return scored[0][1]
+    chosen = scored[0][1] if scored else ""
+    trace(
+        "turn",
+        "pick",
+        agent=creds.agent_name,
+        chosen=(chosen or "")[-12:],
+        has_query=has_query,
+        active=len(active) if isinstance(active, list) else -1,
+        listed=len(listed),
+        http=http_error,
+        counts=counts,
+        near=near,
+    )
+    return chosen or None
 
 
 def _parse_iso(s: str) -> float:
@@ -1075,6 +1109,13 @@ class TurnStreamWorker:
             self.state.linger_until = 0.0
         self._seek_agent = creds.agent_name
         self._seek_since = since
+        trace(
+            "turn",
+            "seek_start",
+            agent=creds.agent_name,
+            has_query=bool(broca_q or recovery_query),
+            query_len=len(broca_q or recovery_query or ""),
+        )
         self._notify()
 
         def runner() -> None:
@@ -1166,13 +1207,22 @@ class TurnStreamWorker:
             if run_id:
                 break
             turn = fetch_broca_current_turn(self.agents_root, creds.agent_name)
-            deadline = extend_seek_deadline(
+            new_deadline = extend_seek_deadline(
                 since=since,
                 now=time.time(),
                 deadline=deadline,
                 broca_active=bool(turn.get("active")),
                 max_s=self.SEEK_MAX_S,
             )
+            if new_deadline != deadline:
+                trace(
+                    "turn",
+                    "seek_extend",
+                    agent=creds.agent_name,
+                    broca_active=bool(turn.get("active")),
+                    extra_s=int(new_deadline - since),
+                )
+            deadline = new_deadline
             time.sleep(0.6)
         if self._stop_event.is_set() or not self._gen_ok(gen):
             return
@@ -1188,6 +1238,13 @@ class TurnStreamWorker:
                 )
                 self.state.lingering = True
                 self.state.linger_until = time.time() + 20.0
+            trace(
+                "turn",
+                "seek_give_up",
+                agent=creds.agent_name,
+                waited_s=int(time.time() - since),
+                query_len=len(recovery_query or ""),
+            )
             self._notify()
             return
 
@@ -1267,6 +1324,7 @@ class TurnStreamWorker:
         stream_error = ""
         poll_stop = threading.Event()
         known_ids: set[str] = set()
+        trace("turn", "stream_open", agent=creds.agent_name, run=(run_id or "")[-12:])
 
         def _is_placeholder(cur: str) -> bool:
             c = (cur or "").strip()
@@ -1450,6 +1508,14 @@ class TurnStreamWorker:
                     OSError,
                 ) as exc:
                     stream_error = str(exc)[:200]
+                    trace(
+                        "turn",
+                        "stream_error",
+                        agent=creds.agent_name,
+                        run=(run_id or "")[-12:],
+                        error=type(exc).__name__,
+                        detail=stream_error,
+                    )
                     if self._stop_event.is_set() or not self._gen_ok(gen):
                         break
                     err_l = stream_error.lower()
@@ -1602,6 +1668,15 @@ class TurnStreamWorker:
             self.state.linger_until = time.time() + self.LINGER_S
             if final and not final.endswith("— turn complete —"):
                 self.state.text = final + "\n\n— turn complete —"
+            trace(
+                "turn",
+                "stream_end",
+                agent=creds.agent_name,
+                run=(run_id or "")[-12:],
+                status=status,
+                chars=len(api_text or ""),
+                error=(stream_error or "")[:120],
+            )
         self._notify()
 
     def _notify(self) -> None:
