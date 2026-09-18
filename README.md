@@ -20,10 +20,12 @@ To pick up a new git revision on moya:
 
 ```bash
 git -C ~/sanctum/repos/stop pull --ff-only
-~/sanctum/repos/stop/tools/reload-in-screen.sh   # Ctrl-C TUI + relaunch; session stays
+~/sanctum/repos/stop/tools/reload-in-screen.sh   # relaunch TUI inside screen; session stays
 ```
 
-Start the TUI **without** `exec` so `q` / Ctrl-C leaves bash alive inside the screen.
+If Mark is **Attached**, that script **skips** the relaunch (restarting `stop`
+resets selection/scroll). Detach first, or `STOP_RELOAD_FORCE=1` only when he
+asks. Start the TUI **without** `exec` so `q` leaves bash alive inside the screen.
 
 ## Run
 
