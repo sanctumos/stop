@@ -353,18 +353,27 @@ class WindowPane(Vertical):
         self._feed.sync(log, w.last_scrollback, source_key=source_key)
 
     def show_turn(self, state: TurnStreamState) -> None:
-        """Show/hide the turn-stream split under the selected log."""
+        """Show/hide the turn-stream overlay under the selected log."""
         panel = self.query_one("#turn-panel")
         meta = self.query_one("#turn-meta", Static)
         log = self.query_one("#turn-log", RichLog)
         want = bool(state.enabled and state.active and (state.text or state.error))
         revealing = want and not self._turn_visible
+        hiding = (not want) and self._turn_visible
         if want != self._turn_visible:
             panel.display = want
             self._turn_visible = want
             if not want:
                 self._turn_body = None
                 log.clear()
+            # Docked overlay should not resize #win-log; still nudge scroll-end
+            # after layout in case the terminal redraws the sibling pane.
+            if hiding or revealing:
+                try:
+                    win_log = self.query_one("#win-log", RichLog)
+                    self.call_after_refresh(lambda: win_log.scroll_end(animate=False))
+                except Exception:
+                    pass
         if not want:
             return
         elapsed = ""
@@ -543,16 +552,23 @@ class StopApp(App[None]):
         width: 1fr; height: 100%;
         border: solid $primary;
         padding: 0 1;
+        layout: vertical;
     }
     #win-meta { height: auto; max-height: 8; }
     #win-log { height: 1fr; background: transparent; }
+    /* Overlay — do not steal height from #win-log. Toggling display was
+       resizing the live log and jumping scroll ("view reset" at linger end). */
     #turn-panel {
-        height: 1fr; max-height: 50%;
+        dock: bottom;
+        width: 100%;
+        height: auto;
+        max-height: 45%;
         border: solid $success;
         padding: 0 1;
+        background: $surface;
     }
     #turn-meta { height: 1; }
-    #turn-log { height: 1fr; min-height: 5; background: transparent; }
+    #turn-log { height: auto; max-height: 20; min-height: 5; background: transparent; }
     #active {
         width: 1fr; height: 100%;
         border: solid $warning;
