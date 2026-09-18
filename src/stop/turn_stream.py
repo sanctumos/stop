@@ -368,11 +368,20 @@ def pick_run_id(
             continue
         created = r.get("created_at") or ""
         created_epoch = _parse_iso(created)
-        if created_epoch and created_epoch < floor:
-            continue
         status = (r.get("status") or "").lower()
-        # Rank: running/created > completed (still streamable for catch-up).
-        rank = 2 if status in ("running", "created") else 1
+        # Prefer in-flight runs. Completed runs are catch-up only for *this*
+        # turn — a prior finished run inside the wide floor must not steal the
+        # pane (that showed the previous query while waiting).
+        if status in ("running", "created"):
+            if created_epoch and created_epoch < floor:
+                continue
+            rank = 2
+        elif status in ("completed", "succeeded"):
+            if not created_epoch or created_epoch < since_epoch - 8.0:
+                continue
+            rank = 1
+        else:
+            continue
         score = rank * 1e12 + (created_epoch or 0.0)
         if best is None or score > best[0]:
             best = (score, rid)
