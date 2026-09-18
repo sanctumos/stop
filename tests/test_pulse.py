@@ -27,6 +27,11 @@ def _agent(name: str, text: str, *, log: str = "") -> Agent:
     return Agent(name=name, windows=windows)
 
 
+def test_glyphs_are_in_the_moya_console_font():
+    # Uni2-Fixed16 on tty1. Eighth-blocks and .:-=+*# are the wrong answer.
+    assert GLYPHS == "─░▒█"
+
+
 def test_blank_screen_uses_that_agents_run_log_only():
     agent = _agent("longfellow", "\n\n", log="Retrieved 0 messages from web chat API\n")
     assert "web chat API" in activity_text(agent)

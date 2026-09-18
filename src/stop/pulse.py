@@ -9,9 +9,11 @@ from .activity import KIND_NOISE, classify_line
 from .livelog import unwrap_screen_hardcopy
 from .models import Agent
 
-# Eighth-blocks (▁▂▃…) render as diamonds in the font on moya's screen.
-# These are plain ASCII, same idea as the host meters avoiding shade glyphs.
-GLYPHS = ".:-=+*#"
+# tty1 on moya uses the 512-glyph Uni2-Fixed16 console font. It has █ ░ ▒
+# and box drawing, and it does not have the eighth-blocks (▁▂▃…). Missing
+# glyphs draw as diamonds. These four get darker with volume, same idea as
+# the CPU bar, and they are actually in that font.
+GLYPHS = "─░▒█"
 
 
 def activity_text(agent: Agent) -> str:
