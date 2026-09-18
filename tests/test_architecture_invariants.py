@@ -66,23 +66,35 @@ def test_calling_from_ui_thread_helper():
     assert calling_from_ui_thread(None) is False
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Host I/O still runs on Textual UI thread — fix #4061",
-)
 def test_livehost_snapshot_must_not_run_on_ui_thread():
-    """Invariant: LiveHost.snapshot must not execute on the Textual main thread."""
+    """Invariant: LiveHost.snapshot must not execute on the Textual main thread.
+
+    HostCollector clears ui_thread_ident before calling snapshot. Accidental
+    UI-thread snapshot() still bumps METRICS.host_io_on_ui_thread.
+    """
     host = LiveHost()
     host.ui_thread_ident = threading.get_ident()
     before = METRICS.host_io_on_ui_thread
-    # Even without real screens, snapshot path should detect UI-thread violation.
+    # Direct call from "UI" thread must be detected.
     try:
         host.snapshot()
     except Exception:
         pass
-    assert METRICS.host_io_on_ui_thread == before, (
-        "snapshot ran on the UI thread (counter bumped) — move collection off-loop (#4061)"
-    )
+    assert METRICS.host_io_on_ui_thread > before
+
+    # Collector path must not bump.
+    before2 = METRICS.host_io_on_ui_thread
+    from stop.collector import HostCollector
+
+    col = HostCollector(host)
+    col.start()
+    try:
+        deadline = time.time() + 3.0
+        while time.time() < deadline and col.latest()[0] < 1:
+            time.sleep(0.05)
+        assert METRICS.host_io_on_ui_thread == before2
+    finally:
+        col.stop()
 
 
 @pytest.mark.xfail(

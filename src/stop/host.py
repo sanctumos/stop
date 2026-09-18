@@ -203,20 +203,54 @@ class LiveHost(HostBackend):
         self._cpu_primed = False
         # Hardcopy is expensive — throttle and skip excluded screens.
         self.hardcopy_interval_s = 2.0
+        self.hardcopy_batch_budget_s = 2.0
+        self.hardcopy_max_screens = 4
         self._last_hardcopy_epoch = 0.0
-        self._focus_screens: set[str] = set()
+        # Ordered focus: selected Broca → Active Now → Letta → secondary (#4062).
+        self._focus_order: list[str] = []
         self._last_alive_epoch: dict[str, float] = {}
         self._returned_at: dict[str, float] = {}
+        # Bridge dir counts: cache so we do not iterdir every tick.
+        self._bridge_count_cache: dict[str, tuple[float, int, int]] = {}
+        self._bridge_count_interval_s = 4.0
         # (epoch, bytes_sent, bytes_recv) for net rate
         self._prev_net: tuple[float, int, int] | None = None
         # Textual main-thread id when known — snapshot must not run there (#4061).
         self.ui_thread_ident: int | None = None
 
-    def set_focus_screens(self, names: set[str]) -> None:
-        """Prefer hardcopying these screens (selected agent + Active Now + letta)."""
-        self._focus_screens = {n for n in names if n and n not in NEVER_HARDCOPY}
-        # Dedicated bottom-right pane always watches Letta when it exists.
-        self._focus_screens.add("letta")
+    def set_focus_screens(self, names) -> None:
+        """Set hardcopy priority order (deduped). Accepts list or set."""
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for n in names:
+            if not n or n in NEVER_HARDCOPY or n in seen:
+                continue
+            ordered.append(n)
+            seen.add(n)
+        if "letta" not in seen:
+            ordered.append("letta")
+        self._focus_order = ordered
+
+    @staticmethod
+    def prioritize_hardcopy(
+        focus_order: list[str],
+        *,
+        available: set[str],
+        max_screens: int = 4,
+    ) -> list[str]:
+        """Deterministic hardcopy order: keep focus priority, drop missing, cap."""
+        out: list[str] = []
+        seen: set[str] = set()
+        for n in focus_order:
+            if n in NEVER_HARDCOPY or n in seen:
+                continue
+            if n not in available:
+                continue
+            out.append(n)
+            seen.add(n)
+            if len(out) >= max_screens:
+                return out
+        return out
 
     def _read_crontab(self) -> str:
         try:
@@ -253,8 +287,7 @@ class LiveHost(HostBackend):
 
         now = time.time()
         do_hardcopy = (now - self._last_hardcopy_epoch) >= self.hardcopy_interval_s
-        if do_hardcopy:
-            self._last_hardcopy_epoch = now
+        # Completion timestamp is set AFTER the batch — not before (#4062).
 
         crontab = self._read_crontab()
         screens = parse_screen_list(self._read_screen_list())
@@ -267,105 +300,89 @@ class LiveHost(HostBackend):
             now_epoch=now,
         )
 
-        # Decide which screens to hardcopy this tick.
-        want: set[str] = set(self._focus_screens)
+        available: set[str] = set()
         for agent in agents:
             for w in agent.windows:
-                if not w.screen_name:
-                    continue
-                if w.screen_name in NEVER_HARDCOPY:
-                    continue
-                # Letta is only hardcopied when explicitly focused (always is).
-                if w.screen_name in EXCLUDED_SCREEN_NAMES and w.screen_name not in want:
+                if not w.screen_name or w.screen_name in NEVER_HARDCOPY:
                     continue
                 if w.state in (WindowState.MISSING, WindowState.UNMANAGED, WindowState.DEAD):
                     continue
-                # Always include broca-* when focused empty (first paint): sample a few.
-                if not want and w.screen_name.startswith("broca-"):
-                    want.add(w.screen_name)
-                elif w.screen_name in want:
-                    pass
-        # Cap hardcopies per tick hard — moya is a 2-core box.
-        # Prefer letta + focused screens when over cap.
-        if len(want) > 4:
-            preferred = [n for n in want if n == "letta" or n in self._focus_screens]
-            rest = [n for n in want if n not in preferred]
-            want = set((preferred + rest)[:4])
+                available.add(w.screen_name)
+
+        focus = list(self._focus_order)
+        if not any(n.startswith("broca-") for n in focus):
+            # Cold start: sample a few brocas in stable name order.
+            for n in sorted(s for s in available if s.startswith("broca-")):
+                if n not in focus:
+                    focus.append(n)
+        want_list = self.prioritize_hardcopy(
+            focus, available=available, max_screens=self.hardcopy_max_screens
+        )
+        want = set(want_list)
+
+        # Prune scroll + bridge caches for gone screens.
+        alive_names = {s.name for s in screens}
+        for stale in [k for k in self._scroll_cache if k not in alive_names]:
+            self._scroll_cache.pop(stale, None)
+        for stale in [k for k in self._bridge_count_cache if k not in alive_names]:
+            self._bridge_count_cache.pop(stale, None)
+
+        batch_deadline = time.perf_counter() + self.hardcopy_batch_budget_s
+        hardcopied: set[str] = set()
+        if do_hardcopy:
+            for screen_name in want_list:
+                if time.perf_counter() >= batch_deadline:
+                    break
+                # Apply to every window sharing this screen name.
+                for agent in agents:
+                    for w in agent.windows:
+                        if w.screen_name != screen_name:
+                            continue
+                        text = self.read_scrollback(w.screen_name)
+                        stripped = text.strip()
+                        if stripped:
+                            prev_cached = self._scroll_cache.get(w.screen_name)
+                            prev_text = (prev_cached[1] if prev_cached else "").strip()
+                            if stripped != prev_text:
+                                if w.screen_name != "letta" and not scrollback_delta_is_noise_only(
+                                    prev_text, stripped
+                                ):
+                                    w.last_activity_epoch = now
+                            w.last_scrollback = text
+                            self._scroll_cache[w.screen_name] = (now, text)
+                        hardcopied.add(screen_name)
+            self._last_hardcopy_epoch = time.time()
 
         for agent in agents:
             for w in agent.windows:
                 if w.screen_name and w.screen_name in NEVER_HARDCOPY:
                     continue
-                if (
-                    do_hardcopy
-                    and w.screen_name
-                    and w.screen_name in want
-                    and w.state not in (WindowState.MISSING, WindowState.UNMANAGED)
-                ):
-                    text = self.read_scrollback(w.screen_name)
-                    stripped = text.strip()
-                    if stripped:
-                        prev_cached = self._scroll_cache.get(w.screen_name)
-                        prev_text = (prev_cached[1] if prev_cached else "").strip()
-                        if stripped != prev_text:
-                            # Bridge/httpx noise must not bump activity epoch —
-                            # that was flipping Active Now between Brocas.
-                            # Letta pane is display-only — never drives Active Now.
-                            if w.screen_name != "letta" and not scrollback_delta_is_noise_only(
-                                prev_text, stripped
-                            ):
-                                w.last_activity_epoch = now
-                        w.last_scrollback = text
-                        self._scroll_cache[w.screen_name] = (now, text)
-                elif w.screen_name and w.screen_name in self._scroll_cache:
-                    # Reuse last good capture between hardcopy ticks.
-                    _, cached = self._scroll_cache[w.screen_name]
-                    w.last_scrollback = cached
-                elif w.log_path:
-                    p = Path(w.log_path)
-                    if p.is_file():
-                        # Always show a fresh log tail for cron/run panes.
-                        text = _tail_file(p)
-                        if text.strip():
-                            # Poll noise (webchat "Retrieved 0 messages", etc.) must
-                            # not bump last_activity — that made longfellow's age
-                            # reset every ~3s while the log grew.
-                            if not scrollback_delta_is_noise_only(
-                                w.last_scrollback, text
-                            ):
-                                try:
-                                    mtime = p.stat().st_mtime
-                                    w.last_activity_epoch = max(
-                                        w.last_activity_epoch, mtime
-                                    )
-                                except OSError:
-                                    pass
-                            w.last_scrollback = text
+                if w.screen_name and w.screen_name not in hardcopied:
+                    if w.screen_name in self._scroll_cache:
+                        _, cached = self._scroll_cache[w.screen_name]
+                        w.last_scrollback = cached
+                    elif w.log_path:
+                        p = Path(w.log_path)
+                        if p.is_file():
+                            text = _tail_file(p)
+                            if text.strip():
+                                if not scrollback_delta_is_noise_only(
+                                    w.last_scrollback, text
+                                ):
+                                    try:
+                                        mtime = p.stat().st_mtime
+                                        w.last_activity_epoch = max(
+                                            w.last_activity_epoch, mtime
+                                        )
+                                    except OSError:
+                                        pass
+                                w.last_scrollback = text
 
-                # otto_bridge counts + mtime (file counts only — no DB)
+                # otto_bridge counts — cached; not every tick.
                 if agent.name != "System" and w.screen_name and w.screen_name.startswith("broca-"):
-                    bridge = self.agents_root / agent.name / "broca" / "run" / "otto_bridge"
-                    if bridge.is_dir():
-                        latest = 0.0
-                        inbox_n = outbox_n = 0
-                        try:
-                            for sub, counter in (("inbox", "in"), ("outbox", "out")):
-                                d = bridge / sub
-                                if d.is_dir():
-                                    n = 0
-                                    for f in d.iterdir():
-                                        if f.is_file():
-                                            n += 1
-                                    if counter == "in":
-                                        inbox_n = n
-                                    else:
-                                        outbox_n = n
-                        except OSError:
-                            pass
-                        w.bridge_inbox_count = inbox_n
-                        w.bridge_outbox_count = outbox_n
-                        # Do NOT bump last_activity_epoch from bridge file mtimes —
-                        # outbox churn flipped Active Now between Brocas constantly.
+                    inbox_n, outbox_n = self._bridge_counts(agent.name, now)
+                    w.bridge_inbox_count = inbox_n
+                    w.bridge_outbox_count = outbox_n
 
                 # seconds missing since last alive
                 if w.state in (WindowState.RUNNING, WindowState.RETURNED):
@@ -378,8 +395,10 @@ class LiveHost(HostBackend):
                 prev = self._prev_states.get(w.id)
                 if prev is not None and not is_failure(prev) and is_failure(w.state):
                     self._events.append(CrashEvent(now, f"{w.label} died"))
+                    self._events = self._events[-50:]
                 if prev is not None and is_failure(prev) and w.state == WindowState.RETURNED:
                     self._events.append(CrashEvent(now, f"{w.label} back"))
+                    self._events = self._events[-50:]
                     self._returned_at[w.id] = now
                 if w.state == WindowState.RETURNED:
                     w.returned_at_epoch = self._returned_at.get(w.id, now)
@@ -428,6 +447,27 @@ class LiveHost(HostBackend):
         )
         METRICS.record_snapshot(time.perf_counter() - t0)
         return snap
+
+    def _bridge_counts(self, agent_name: str, now: float) -> tuple[int, int]:
+        cached = self._bridge_count_cache.get(agent_name)
+        if cached and (now - cached[0]) < self._bridge_count_interval_s:
+            return cached[1], cached[2]
+        bridge = self.agents_root / agent_name / "broca" / "run" / "otto_bridge"
+        inbox_n = outbox_n = 0
+        if bridge.is_dir():
+            try:
+                for sub, counter in (("inbox", "in"), ("outbox", "out")):
+                    d = bridge / sub
+                    if d.is_dir():
+                        n = sum(1 for f in d.iterdir() if f.is_file())
+                        if counter == "in":
+                            inbox_n = n
+                        else:
+                            outbox_n = n
+            except OSError:
+                pass
+        self._bridge_count_cache[agent_name] = (now, inbox_n, outbox_n)
+        return inbox_n, outbox_n
 
     def read_scrollback(self, screen_name: str) -> str:
         """Hardcopy into our tmp dir only — never attach, never quit.

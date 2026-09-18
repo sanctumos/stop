@@ -14,6 +14,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Footer, Header, Input, RichLog, Static
 
 from .activity import pick_active_now
+from .collector import HostCollector
 from .config import StopConfig, apply_agent_order, load_config
 from .host import FixtureHost, HostBackend, LiveHost
 from .livelog import LiveLogFeed
@@ -644,13 +645,23 @@ class StopApp(App[None]):
         self._win_index = 0
         self._narrow_page = "agents"
         self._errors = 0
+        self._painted_rev = -1
+        self._last_collect_error = ""
         self._turn: TurnStreamWorker | None = None
+        self._collector = HostCollector(host, on_update=self._on_collector_update)
         if isinstance(self.host, LiveHost):
             self.host.hardcopy_interval_s = float(self.config.refresh_hardcopy_s)
             self._turn = TurnStreamWorker(
                 agents_root=self.host.agents_root,
                 on_update=self._on_turn_update,
             )
+
+    def _on_collector_update(self) -> None:
+        try:
+            self.call_from_thread(self._paint_from_collector)
+        except Exception:
+            # App may not be running yet / already exiting.
+            pass
 
     def _on_turn_update(self) -> None:
         """Worker thread → UI thread: repaint turn pane immediately."""
@@ -684,13 +695,18 @@ class StopApp(App[None]):
     def on_mount(self) -> None:
         import threading
 
+        # Mark the Textual thread so accidental LiveHost.snapshot() from here is counted.
         if isinstance(self.host, LiveHost):
             self.host.ui_thread_ident = threading.get_ident()
+        self._collector.start()
         interval = max(1.0, float(self.config.refresh_host_s))
         self.set_interval(interval, self.refresh_host)
         self.refresh_host()
         self.query_one(AgentList).focus()
         self._apply_breakpoint()
+
+    def on_unmount(self) -> None:
+        self._collector.stop(timeout=2.0)
 
     def on_resize(self, event) -> None:  # noqa: ANN001
         self._apply_breakpoint()
@@ -727,17 +743,29 @@ class StopApp(App[None]):
     def _update_focus_screens(self, selected: Agent | None, active: Window | None) -> None:
         if not isinstance(self.host, LiveHost):
             return
-        names: set[str] = set()
+        # Ordered priority: selected Broca → Active Now → Letta → selected secondary.
+        ordered: list[str] = []
         if selected:
             for w in selected.windows:
-                if w.screen_name:
-                    names.add(w.screen_name)
+                if w.screen_name and (w.screen_name or "").startswith("broca-"):
+                    ordered.append(w.screen_name)
+                    break
         if active and active.screen_name:
-            names.add(active.screen_name)
-        names.add("letta")
-        self.host.set_focus_screens(names)
+            ordered.append(active.screen_name)
+        ordered.append("letta")
+        if selected:
+            for w in selected.windows:
+                if (
+                    w.screen_name
+                    and w.screen_name not in ordered
+                    and w.screen_name not in ("stop",)
+                ):
+                    ordered.append(w.screen_name)
+        self.host.set_focus_screens(ordered)
 
     def refresh_host(self) -> None:
+        """UI tick: request background collect + paint newest completed revision."""
+        # Focus screens from last paint before waking the worker.
         try:
             agents_w = self.query_one(AgentList)
             selected = agents_w.selected() if self._snap else None
@@ -749,11 +777,35 @@ class StopApp(App[None]):
                     exclude_screens=frozenset(self.config.active_exclude),
                 )
             self._update_focus_screens(selected, active_guess)
+        except Exception:
+            pass
+        self._collector.request()
+        self._paint_from_collector()
 
-            snap = self.host.snapshot()
+    def _paint_from_collector(self) -> None:
+        try:
+            rev, snap, err = self._collector.latest()
+            if snap is None:
+                if err and err != self._last_collect_error:
+                    self._last_collect_error = err
+                    self._errors += 1
+                    self.query_one(EventStrip).update(
+                        f"[red]refresh error ({self._errors}): {_plain(err[:80])}[/red]"
+                    )
+                return
+            if rev == self._painted_rev:
+                if err and err != self._last_collect_error:
+                    self._last_collect_error = err
+                    self.query_one(EventStrip).update(
+                        f"[red]refresh error: {_plain(err[:80])}[/red]"
+                    )
+                return
+            self._painted_rev = rev
+            self._last_collect_error = err
             snap.agents = apply_agent_order(snap.agents, self.config)
             self._snap = snap
             self.query_one(HostStrip).show(snap)
+            agents_w = self.query_one(AgentList)
             agents_w.filter = self._filter
             agents_w.set_agents(snap.agents)
             selected = agents_w.selected()
@@ -769,7 +821,12 @@ class StopApp(App[None]):
             )
             self.query_one(LettaPane).show(self._letta_window(snap))
             self._tick_turn_stream(selected)
-            self.query_one(EventStrip).show(snap)
+            if err:
+                self.query_one(EventStrip).update(
+                    f"[red]refresh error: {_plain(err[:80])}[/red]"
+                )
+            else:
+                self.query_one(EventStrip).show(snap)
             self._errors = 0
             METRICS.bump_render_revision()
             if METRICS.snapshot_count and METRICS.snapshot_count % 30 == 0:
