@@ -600,7 +600,7 @@ class StopApp(App[None]):
     SUB_TITLE = "SanctumOS-top"
     CSS = """
     Screen { layout: vertical; }
-    #host { height: 2; dock: top; background: $boost; padding: 0 1; }
+    #host { height: 2; background: $boost; padding: 0 1; }
     #events { height: 1; color: $text-muted; padding: 0 1; }
     #body { height: 1fr; }
     #row { height: 2fr; }
@@ -651,7 +651,8 @@ class StopApp(App[None]):
     #agents:focus, #windows:focus, #active:focus, #letta:focus {
         border: heavy $success;
     }
-    #chrome { height: 1; dock: top; color: $text-muted; padding: 0 1; }
+    #chrome { height: 1; color: $text-muted; padding: 0 1; }
+    #top-chrome { dock: top; height: auto; layout: vertical; }
     #bottom-chrome {
         dock: bottom;
         height: auto;
@@ -824,8 +825,9 @@ class StopApp(App[None]):
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
-        yield HostStrip(id="host")
-        yield Static(id="chrome")
+        with Vertical(id="top-chrome"):
+            yield HostStrip(id="host")
+            yield Static(id="chrome")
         with Vertical(id="body"):
             with Horizontal(id="row"):
                 yield AgentList(id="agents")
