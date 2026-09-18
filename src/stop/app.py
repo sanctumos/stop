@@ -264,6 +264,7 @@ class WindowPane(Vertical):
         self._win_index = 0
         self._turn_visible = False
         self._turn_body: str | None = None
+        self._empty_kind: str | None = None  # none|select|empty — avoid repeat clears
 
     def compose(self) -> ComposeResult:
         yield Static(id="win-meta")
@@ -306,17 +307,22 @@ class WindowPane(Vertical):
         if agent is None:
             _set_title(self, "windows")
             _paint(meta, "(select an agent)")
-            self._feed.reset()
-            log.clear()
+            if self._empty_kind != "select":
+                self._feed.reset()
+                log.clear()
+                self._empty_kind = "select"
             return
 
         if not agent.windows:
             _set_title(self, f"{agent.name} windows")
             _paint(meta, "(no windows)")
-            self._feed.reset()
-            log.clear()
+            if self._empty_kind != "empty":
+                self._feed.reset()
+                log.clear()
+                self._empty_kind = "empty"
             return
 
+        self._empty_kind = None
         w = agent.windows[win_index % len(agent.windows)]
         broca = next(
             (x for x in agent.windows if (x.screen_name or "").startswith("broca-")),
@@ -351,7 +357,8 @@ class WindowPane(Vertical):
             _paint(meta, "\n".join(lines) if lines else "(none)")
 
         # Live log = selected window only; append new lines, never rewrite on idle.
-        source_key = f"{agent.name}:{w.id}:{self.expanded}"
+        # Do not include expanded in the key — Enter/Esc must not clear the log (#4067).
+        source_key = f"{agent.name}:{w.id}"
         self._feed.sync(log, w.last_scrollback, source_key=source_key)
 
     def show_turn(self, state: TurnStreamState) -> None:
@@ -367,15 +374,7 @@ class WindowPane(Vertical):
             if not want:
                 self._turn_body = None
                 log.clear()
-            # Docked overlay must not resize #win-log. On hide: leave the live
-            # log alone (no scroll_end — that itself looked like a view reset).
-            # On reveal: nudge scroll-end once after the overlay paints.
-            if revealing:
-                try:
-                    win_log = self.query_one("#win-log", RichLog)
-                    self.call_after_refresh(lambda: win_log.scroll_end(animate=False))
-                except Exception:
-                    pass
+            # Absolute overlay must not touch #win-log scroll or geometry.
         if not want:
             return
         elapsed = ""
@@ -448,6 +447,7 @@ class ActiveNowPane(Vertical):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._feed = LiveLogFeed(limit=200, width=200)
+        self._was_idle = False
 
     def compose(self) -> ComposeResult:
         yield Static(id="active-meta")
@@ -471,10 +471,13 @@ class ActiveNowPane(Vertical):
         if window is None:
             _set_title(self, f"Active Now{lock}")
             _paint(meta, "[dim](idle — waiting for human/agent dialogue)[/dim]")
-            self._feed.reset()
-            log.clear()
+            if not self._was_idle:
+                self._feed.reset()
+                log.clear()
+                self._was_idle = True
             return
 
+        self._was_idle = False
         style = _state_style(window.state)
         age = _age_stable(window.last_activity_epoch)
         kind, hits, _ = classify_scrollback(window.last_scrollback)
@@ -497,6 +500,7 @@ class LettaPane(Vertical):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._feed = LiveLogFeed(limit=200, width=200)
+        self._was_missing = False
 
     def compose(self) -> ComposeResult:
         yield Static(id="letta-meta")
@@ -516,9 +520,12 @@ class LettaPane(Vertical):
         if window is None:
             _set_title(self, "letta")
             _paint(meta, "[dim](letta screen not running)[/dim]")
-            self._feed.reset()
-            log.clear()
+            if not self._was_missing:
+                self._feed.reset()
+                log.clear()
+                self._was_missing = True
             return
+        self._was_missing = False
         style = _state_style(window.state)
         up = _age(window.started_at_epoch)
         pid = f" pid={window.last_seen_pid}" if window.last_seen_pid else ""
@@ -550,27 +557,30 @@ class StopApp(App[None]):
         border: solid $accent; border-title-align: left;
         padding: 0 1;
     }
+    #win-meta { height: auto; max-height: 8; layer: base; }
+    #win-log { height: 1fr; background: transparent; layer: base; }
+    /* True overlay: turn layer paints over the log without stealing its height.
+       Prior dock:bottom reflowed #win-log (25→14→25 at 160x45) — idle "reset". */
     #windows {
         width: 1fr; height: 100%;
         border: solid $primary;
         padding: 0 1;
         layout: vertical;
+        layers: base turn;
     }
-    #win-meta { height: auto; max-height: 8; }
-    #win-log { height: 1fr; background: transparent; }
-    /* Overlay — do not steal height from #win-log. Toggling display was
-       resizing the live log and jumping scroll ("view reset" at linger end). */
     #turn-panel {
-        dock: bottom;
+        layer: turn;
+        position: absolute;
+        offset: 0 55%;
         width: 100%;
-        height: auto;
+        height: 45%;
         max-height: 45%;
         border: solid $success;
         padding: 0 1;
         background: $surface;
     }
     #turn-meta { height: 1; }
-    #turn-log { height: auto; max-height: 20; min-height: 5; background: transparent; }
+    #turn-log { height: 1fr; max-height: 100%; min-height: 5; background: transparent; }
     #active {
         width: 1fr; height: 100%;
         border: solid $warning;

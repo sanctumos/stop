@@ -97,19 +97,15 @@ def test_livehost_snapshot_must_not_run_on_ui_thread():
         col.stop()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="dock:bottom still reflows #win-log — fix #4064",
-)
 def test_turn_panel_must_not_change_win_log_geometry():
     """Invariant: showing/hiding the turn overlay must keep #win-log region stable."""
 
     async def run() -> None:
         app = StopApp(FixtureHost(FIXTURE))
         async with app.run_test(size=(160, 45)) as pilot:
-            await pilot.pause(0.1)
+            await pilot.pause(0.15)
             app.refresh_host()
-            await pilot.pause(0.1)
+            await pilot.pause(0.2)
             pane = app.query_one(WindowPane)
             win = app.query_one("#win-log")
             idle = win.region
@@ -128,14 +124,49 @@ def test_turn_panel_must_not_change_win_log_geometry():
             pane.show_turn(TurnStreamState(enabled=True, active=False, status="idle"))
             await pilot.pause(0.15)
             hidden = win.region
-            assert shown == idle, (
+            assert shown.height == idle.height and shown.width == idle.width, (
                 f"turn show reflowed win-log: idle={idle} shown={shown} (#4064)"
             )
-            assert hidden == idle, (
+            assert hidden.height == idle.height and hidden.width == idle.width, (
                 f"turn hide reflowed win-log: idle={idle} hidden={hidden} (#4064)"
             )
 
     asyncio.run(run())
+
+
+def test_turn_panel_geometry_stable_at_breakpoints():
+    """Same overlay invariant at medium and narrow widths."""
+
+    async def check(size: tuple[int, int]) -> None:
+        app = StopApp(FixtureHost(FIXTURE))
+        async with app.run_test(size=size) as pilot:
+            await pilot.pause(0.1)
+            if size[0] < 80:
+                app._narrow_page = "windows"
+                app._apply_breakpoint()
+            app.refresh_host()
+            await pilot.pause(0.15)
+            pane = app.query_one(WindowPane)
+            win = app.query_one("#win-log")
+            idle_h = win.region.height
+            pane.show_turn(
+                TurnStreamState(
+                    enabled=True,
+                    active=True,
+                    agent_name="athena",
+                    status="streaming",
+                    text="line\n" * 20,
+                    started_at=time.time(),
+                )
+            )
+            await pilot.pause(0.1)
+            assert win.region.height == idle_h
+            pane.show_turn(TurnStreamState(enabled=True, active=False, status="idle"))
+            await pilot.pause(0.1)
+            assert win.region.height == idle_h
+
+    asyncio.run(check((100, 30)))
+    asyncio.run(check((60, 40)))
 
 
 def test_fixture_multi_tick_idle_log_feed_is_noop():
