@@ -100,6 +100,84 @@ def test_all_noise_still_shows_quiet_window():
     assert kind == KIND_NOISE  # UI renders this as "quiet"
 
 
+def test_newer_one_line_beats_older_many_dialogue_hits():
+    """Epoch wins over stale hit-count (#4068)."""
+    now = time.time()
+    old_busy = Window(
+        id="zzz/broca",
+        label="broca-old",
+        screen_name="broca-old",
+        state=WindowState.RUNNING,
+        last_activity_epoch=now - 120,
+        last_scrollback="\n".join(
+            [f"telegram inbound msg {i}" for i in range(10)]
+        )
+        + "\n",
+    )
+    fresh = Window(
+        id="aaa/broca",
+        label="broca-new",
+        screen_name="broca-new",
+        state=WindowState.RUNNING,
+        last_activity_epoch=now,
+        last_scrollback="telegram inbound just now\n",
+    )
+    agents = [
+        Agent(name="old", cron_managed=True, windows=[old_busy]),
+        Agent(name="new", cron_managed=True, windows=[fresh]),
+    ]
+    ranked = rank_active_windows(agents)
+    assert ranked[0].id == "aaa/broca"
+    assert pick_active_now(agents).id == "aaa/broca"
+
+
+def test_equal_epoch_tie_breaks_by_stable_id():
+    now = time.time()
+    a = Window(
+        id="bbb/broca",
+        label="b",
+        screen_name="broca-b",
+        state=WindowState.RUNNING,
+        last_activity_epoch=now,
+        last_scrollback="telegram inbound\n",
+    )
+    b = Window(
+        id="aaa/broca",
+        label="a",
+        screen_name="broca-a",
+        state=WindowState.RUNNING,
+        last_activity_epoch=now,
+        last_scrollback="telegram inbound\n",
+    )
+    agents = [
+        Agent(name="b", cron_managed=True, windows=[a]),
+        Agent(name="a", cron_managed=True, windows=[b]),
+    ]
+    first = rank_active_windows(agents)[0].id
+    for _ in range(20):
+        assert rank_active_windows(agents)[0].id == first
+    assert first == "aaa/broca"  # lexicographically smaller id wins on full tie
+
+
+def test_follow_lock_released_when_missing():
+    from stop.activity import follow_lock_still_present
+
+    now = time.time()
+    w = Window(
+        id="ada/broca",
+        label="broca-ada",
+        screen_name="broca-ada",
+        state=WindowState.RUNNING,
+        last_activity_epoch=now,
+        last_scrollback="telegram inbound\n",
+    )
+    agents = [Agent(name="ada", cron_managed=True, windows=[w])]
+    assert follow_lock_still_present(agents, "ada/broca") is True
+    assert follow_lock_still_present(agents, "gone") is False
+    locked = pick_active_now(agents, follow_lock_id="ada/broca")
+    assert locked is not None and locked.id == "ada/broca"
+
+
 def test_fixture_ada_still_wins_with_dialogue_text():
     (FIXTURE / "tick").write_text("0")
     now = time.time()
@@ -113,3 +191,4 @@ def test_fixture_ada_still_wins_with_dialogue_text():
     active = pick_active_now(snap.agents)
     assert active is not None
     assert active.screen_name == "broca-ada"
+

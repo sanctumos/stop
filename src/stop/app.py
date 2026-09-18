@@ -13,7 +13,7 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Footer, Header, Input, RichLog, Static
 
-from .activity import pick_active_now
+from .activity import follow_lock_still_present, pick_active_now
 from .collector import HostCollector
 from .config import StopConfig, apply_agent_order, load_config
 from .host import FixtureHost, HostBackend, LiveHost
@@ -899,6 +899,11 @@ class StopApp(App[None]):
                 pane._window_fell_back = False
                 if self.selected_window_id:
                     notes.append(f"window → {self.selected_window_id}")
+            if self.follow_lock_id and not follow_lock_still_present(
+                snap.agents, self.follow_lock_id
+            ):
+                notes.append("follow-lock released (target gone)")
+                self.follow_lock_id = None
             active = pick_active_now(
                 snap.agents,
                 follow_lock_id=self.follow_lock_id,

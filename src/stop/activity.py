@@ -113,7 +113,13 @@ def rank_active_windows(
     *,
     exclude_screens: frozenset[str] | None = None,
 ) -> list[Window]:
-    """Windows sorted for Active Now: dialogue first, then other; noise last."""
+    """Windows sorted for Active Now: class → meaningful time → hits → id.
+
+    Dialogue beats other beats noise. Within a class, the most recent
+    *meaningful* ``last_activity_epoch`` wins (noise deltas must not advance
+    that epoch — see host hardcopy). Dialogue-hit count is only a tie-breaker;
+    stable ``window.id`` breaks remaining ties so equal timestamps do not flip.
+    """
     exclude = exclude_screens if exclude_screens is not None else EXCLUDED_SCREEN_NAMES
     candidates: list[Window] = []
     for agent in agents:
@@ -133,11 +139,24 @@ def rank_active_windows(
         kind, hits, _ = classify_scrollback(w.last_scrollback)
         # Noise-only windows sort to the bottom even if their epoch is newest.
         epoch = w.last_activity_epoch if kind >= KIND_OTHER else 0.0
-        is_broca = 1 if (w.screen_name or "").startswith("broca-") else 0
-        return (kind, hits, epoch, is_broca)
+        # Ascending on negated primaries + id → deterministic, no flip-flops.
+        return (-kind, -epoch, -hits, w.id)
 
-    candidates.sort(key=_key, reverse=True)
+    candidates.sort(key=_key)
     return candidates
+
+
+def follow_lock_still_present(
+    agents: list[Agent], follow_lock_id: str | None
+) -> bool:
+    """True when the locked window id still exists in the inventory."""
+    if not follow_lock_id:
+        return False
+    for agent in agents:
+        for w in agent.windows:
+            if w.id == follow_lock_id:
+                return True
+    return False
 
 
 def pick_active_now(
@@ -152,7 +171,13 @@ def pick_active_now(
         for w in ranked:
             if w.id == follow_lock_id:
                 return w
-        # Lock target gone — fall through to auto.
+        # Also honor lock if the window exists but was filtered from ranked
+        # (e.g. empty scrollback) — operator explicitly locked it.
+        for agent in agents:
+            for w in agent.windows:
+                if w.id == follow_lock_id:
+                    return w
+        # Lock target gone — fall through to auto (caller clears the lock).
     if not ranked:
         return None
     # Prefer dialogue/other signal; if everything is noise, still show the top
