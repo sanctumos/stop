@@ -12,25 +12,50 @@
 # Usage (on moya as rizzn):
 #   ~/sanctum/repos/stop/tools/reload-in-screen.sh
 #
-# Optional: pull first
-#   git -C ~/sanctum/repos/stop pull --ff-only && ~/sanctum/repos/stop/tools/reload-in-screen.sh
+# Env:
+#   STOP_REPO          — repo root (default: dirname of this script / ..)
+#   STOP_SCREEN_NAME   — session name (default: stop)
+#   STOP_RELOAD_FORCE=1 — allow reload while Attached
+#   PATH               — may include a fake `screen` for tests
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+STOP_REPO="${STOP_REPO:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 SCREEN_NAME="${STOP_SCREEN_NAME:-stop}"
+VENV_STOP="$STOP_REPO/.venv/bin/stop"
 
-if ! screen -ls 2>&1 | grep -qE "[0-9]+\.${SCREEN_NAME}[[:space:]]"; then
+_screen_ls() {
+  screen -ls 2>&1 || true
+}
+
+# Count exact matches for N.NAME (reject ambiguous NAME collisions).
+_match_lines() {
+  _screen_ls | grep -E "[0-9]+\.${SCREEN_NAME}[[:space:]]" || true
+}
+
+matches="$(_match_lines)"
+count="$(printf '%s\n' "$matches" | grep -c . || true)"
+if [[ -z "$matches" || "$count" -eq 0 ]]; then
   echo "ERROR: screen session '${SCREEN_NAME}' is not running." >&2
   echo "Do NOT auto-create it from automation while Mark may be attached elsewhere." >&2
   echo "If Mark asks to recreate: screen -dmS ${SCREEN_NAME} -h 20000 bash -l" >&2
   exit 2
 fi
+if [[ "$count" -gt 1 ]]; then
+  echo "ERROR: ambiguous screen name '${SCREEN_NAME}' ($count sessions)." >&2
+  echo "$matches" >&2
+  echo "Set STOP_SCREEN_NAME to a unique name or resolve duplicates by hand." >&2
+  exit 3
+fi
 
-# screen -ls lines look like:
-#   1748042.stop   (09/17/2026 06:07:33 PM)   (Attached)
-#   1748042.stop   (09/17/2026 06:07:33 PM)   (Detached)
+# Resolve exact session id (pid.name) for -S targeting.
+SESSION_ID="$(printf '%s\n' "$matches" | head -1 | awk '{print $1}')"
+SESSION_ID="${SESSION_ID%%$'\t'*}"
+SESSION_ID="${SESSION_ID%% *}"
+
 attached=0
-if screen -ls 2>&1 | grep -qE "[0-9]+\.${SCREEN_NAME}[[:space:]].*\(Attached\)"; then
+if printf '%s\n' "$matches" | grep -qE "\(Attached\)"; then
   attached=1
 fi
 
@@ -43,18 +68,26 @@ fi
 
 # Quit the TUI only (binding `q`). Requires stop was started WITHOUT `exec`
 # so bash stays alive inside the screen. Never send commands that kill screen.
-screen -S "$SCREEN_NAME" -X stuff 'q'
+# Forbidden patterns (enforced by tests): -X quit, -X kill, -S ... -X kill,
+# screen -wipe that removes the session, etc.
+screen -S "$SESSION_ID" -X stuff 'q'
 sleep 0.6
-screen -S "$SCREEN_NAME" -X stuff $'cd ~/sanctum/repos/stop && source .venv/bin/activate && stop\n'
+# shellcheck disable=SC2086
+screen -S "$SESSION_ID" -X stuff "cd $(printf %q "$STOP_REPO") && source .venv/bin/activate && stop"$'\n'
 
 # Smoke: process should appear within a few seconds.
 for _ in 1 2 3 4 5 6 7 8; do
-  if pgrep -f "/home/rizzn/sanctum/repos/stop/.venv/bin/stop" >/dev/null 2>&1; then
-    echo "ok: stop TUI reloaded inside screen '${SCREEN_NAME}' (session preserved)"
+  if [[ -x "$VENV_STOP" ]] && pgrep -f "$VENV_STOP" >/dev/null 2>&1; then
+    echo "ok: stop TUI reloaded inside screen '${SESSION_ID}' (session preserved)"
+    exit 0
+  fi
+  # Fallback match: python -m stop / stop entry from this repo.
+  if pgrep -f "$STOP_REPO/.venv/bin/python.*stop" >/dev/null 2>&1; then
+    echo "ok: stop TUI reloaded inside screen '${SESSION_ID}' (session preserved)"
     exit 0
   fi
   sleep 0.5
 done
 
-echo "WARN: screen '${SCREEN_NAME}' still exists but stop process not seen yet" >&2
+echo "WARN: screen '${SESSION_ID}' still exists but stop process not seen yet" >&2
 exit 1
