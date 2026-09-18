@@ -304,6 +304,158 @@ def test_normal_seek_rejects_old_active_even_when_letta_calls_it_running(
     )
 
 
+def test_finished_run_from_this_turn_is_found_when_query_matches(monkeypatch):
+    """A turn that already completed is invisible to the 8s window.
+
+    Athena's messages POST blocked ~50–100s. By the time hardcopy armed
+    the popup, the run was finished and older than 8 seconds, so seek
+    sat on the Broca query and timed out.
+    """
+    from stop.turn_stream import LettaAgentCreds, pick_run_id
+
+    now = time.time()
+    creds = LettaAgentCreds("athena", "agent-x", "k", "http://127.0.0.1:9")
+
+    def iso(epoch: float) -> str:
+        return datetime.fromtimestamp(epoch, timezone.utc).isoformat()
+
+    rows = [
+        {
+            "id": "this-turn",
+            "agent_id": "agent-x",
+            "status": "completed",
+            "background": True,
+            "created_at": iso(now - 90),
+        },
+        {
+            "id": "previous-turn",
+            "agent_id": "agent-x",
+            "status": "completed",
+            "background": True,
+            "created_at": iso(now - 400),
+        },
+    ]
+    monkeypatch.setattr("stop.turn_stream._http_json", lambda *a, **k: [])
+    monkeypatch.setattr("stop.turn_stream.list_runs_for_agent", lambda *a, **k: rows)
+    messages = {
+        "this-turn": [
+            {"message_type": "user_message", "content": "How's your day been?"}
+        ],
+        "previous-turn": [
+            {"message_type": "user_message", "content": "Earlier question"}
+        ],
+    }
+    monkeypatch.setattr(
+        "stop.turn_stream.fetch_run_messages",
+        lambda _creds, rid: messages[rid],
+    )
+    assert (
+        pick_run_id(
+            creds,
+            since_epoch=now,
+            seen_run_ids=set(),
+            recovery_query="How's your day been?",
+            now_epoch=now,
+        )
+        == "this-turn"
+    )
+    assert (
+        pick_run_id(
+            creds,
+            since_epoch=now,
+            seen_run_ids=set(),
+            now_epoch=now,
+        )
+        is None
+    )
+
+
+def test_fresh_running_run_kept_before_user_message_is_stored(monkeypatch):
+    from stop.turn_stream import LettaAgentCreds, pick_run_id
+
+    now = time.time()
+    creds = LettaAgentCreds("athena", "agent-x", "k", "http://127.0.0.1:9")
+    rows = [
+        {
+            "id": "just-started",
+            "agent_id": "agent-x",
+            "status": "running",
+            "background": True,
+            "created_at": datetime.fromtimestamp(now - 2, timezone.utc).isoformat(),
+        }
+    ]
+    monkeypatch.setattr("stop.turn_stream._http_json", lambda *a, **k: rows)
+    monkeypatch.setattr("stop.turn_stream.list_runs_for_agent", lambda *a, **k: [])
+    monkeypatch.setattr("stop.turn_stream.fetch_run_messages", lambda *_a, **_k: [])
+    assert (
+        pick_run_id(
+            creds,
+            since_epoch=now,
+            seen_run_ids=set(),
+            recovery_query="How's your day been?",
+            now_epoch=now,
+        )
+        == "just-started"
+    )
+
+
+def test_seek_deadline_follows_an_open_broca_turn():
+    from stop.turn_stream import extend_seek_deadline
+
+    since = 1_000.0
+    # Broca still processing — do not die at the 45s mark.
+    extended = extend_seek_deadline(
+        since=since,
+        now=since + 50,
+        deadline=since + 45,
+        broca_active=True,
+        max_s=300,
+    )
+    assert extended == since + 53
+    # Cap so a stuck processing flag cannot hold the popup forever.
+    capped = extend_seek_deadline(
+        since=since,
+        now=since + 298,
+        deadline=since + 45,
+        broca_active=True,
+        max_s=300,
+    )
+    assert capped == since + 300
+    # Idle Broca: leave the short deadline alone.
+    assert (
+        extend_seek_deadline(
+            since=since,
+            now=since + 50,
+            deadline=since + 45,
+            broca_active=False,
+            max_s=300,
+        )
+        == since + 45
+    )
+
+
+def test_log_edge_seek_passes_broca_query(tmp_path: Path, monkeypatch):
+    from stop.turn_stream import LettaAgentCreds, TurnStreamWorker
+
+    w = TurnStreamWorker(agents_root=tmp_path)
+    seen: list[str] = []
+
+    def fake_seek(_creds, _since, _gen, recovery_query=""):
+        seen.append(recovery_query)
+
+    monkeypatch.setattr(w, "_seek_and_stream", fake_seek)
+    monkeypatch.setattr(
+        "stop.turn_stream.fetch_broca_triggering_message",
+        lambda *_a, **_k: "How's your day been?",
+    )
+    creds = LettaAgentCreds("athena", "agent-x", "k", "http://127.0.0.1:9")
+    w._start_seek(creds, since=time.time())
+    deadline = time.time() + 1
+    while not seen and time.time() < deadline:
+        time.sleep(0.01)
+    assert seen == ["How's your day been?"]
+
+
 def test_worker_second_tick_with_turn_seeks_without_creds(tmp_path: Path):
     w = TurnStreamWorker(agents_root=tmp_path)
     now = time.time()

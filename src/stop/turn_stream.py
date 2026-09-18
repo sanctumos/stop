@@ -436,7 +436,7 @@ def list_runs_for_agent(
     )
     url = f"{creds.endpoint}/v1/runs/?{q}"
     try:
-        data = _http_json("GET", url, api_key=creds.api_key, timeout=8.0)
+        data = _http_json("GET", url, api_key=creds.api_key, timeout=20.0)
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError):
         # Fallback without agent_id if older Letta rejects the param.
         try:
@@ -445,7 +445,7 @@ def list_runs_for_agent(
                 "GET",
                 f"{creds.endpoint}/v1/runs/?{q2}",
                 api_key=creds.api_key,
-                timeout=8.0,
+                timeout=20.0,
             )
         except (
             urllib.error.URLError,
@@ -598,6 +598,25 @@ def run_query_matches(rows: list[dict], expected_query: str) -> bool:
     return bool(expected and actual and expected == actual)
 
 
+def extend_seek_deadline(
+    *,
+    since: float,
+    now: float,
+    deadline: float,
+    broca_active: bool,
+    max_s: float,
+) -> float:
+    """Keep seeking while Broca still owns the turn, up to ``max_s``.
+
+    A flat 45s seek expires while Letta is still inside the blocking
+    messages POST (these turns run 50–240s). If the run row is not
+    listable until that POST returns, the popup times out on the query.
+    """
+    if not broca_active:
+        return deadline
+    return min(since + max_s, max(deadline, now + 3.0))
+
+
 def pick_run_id(
     creds: LettaAgentCreds,
     *,
@@ -607,15 +626,16 @@ def pick_run_id(
     now_epoch: float | None = None,
     max_recovery_age_s: float = 900.0,
 ) -> str | None:
-    """Choose a fresh run, correlating reload recovery to the Broca query.
+    """Choose a fresh run, correlating it to the Broca query when we have one.
 
     Letta's ``/runs/active`` may include zombie rows many months old. A normal
-    log-edge seek keeps the tight creation-time window. Reload recovery permits
-    a longer-running turn, but only inside the stream wall and only when the
-    run's user message exactly matches Broca's current message.
+    log-edge seek keeps a 3-minute creation window. Completed runs are only
+    that wide when Broca's query is known — otherwise an 8-second catch-up
+    so the previous turn cannot steal the pane. A matching finished run from
+    this turn must still be selectable after Letta's blocking POST returns.
     """
     now_epoch = now_epoch or time.time()
-    recovering = bool(normalized_query(recovery_query))
+    has_query = bool(normalized_query(recovery_query))
     # Active first (scoped when API allows).
     active: object = []
     try:
@@ -624,7 +644,7 @@ def pick_run_id(
             "GET",
             f"{creds.endpoint}/v1/runs/active?{q}",
             api_key=creds.api_key,
-            timeout=5.0,
+            timeout=20.0,
         )
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError):
         try:
@@ -632,7 +652,7 @@ def pick_run_id(
                 "GET",
                 f"{creds.endpoint}/v1/runs/active",
                 api_key=creds.api_key,
-                timeout=5.0,
+                timeout=20.0,
             )
         except (
             urllib.error.URLError,
@@ -646,14 +666,16 @@ def pick_run_id(
         candidates.extend(active)
     candidates.extend(list_runs_for_agent(creds, limit=25))
 
-    best: tuple[float, str] | None = None
     considered: set[str] = set()
-    live_floor = (
-        now_epoch - max_recovery_age_s if recovering else since_epoch - 180.0
-    )
-    completed_floor = (
-        now_epoch - max_recovery_age_s if recovering else since_epoch - 8.0
-    )
+    # 3 minutes covers a turn we noticed late. With the Broca text, also
+    # reach back across a reload (max_recovery_age_s). Without it, a
+    # finished run is only eligible for 8 seconds — long enough to catch
+    # a run that just completed, short enough to ignore the previous turn.
+    tight_floor = since_epoch - 180.0
+    wide_floor = now_epoch - max_recovery_age_s
+    live_floor = min(tight_floor, wide_floor) if has_query else tight_floor
+    completed_floor = wide_floor if has_query else since_epoch - 8.0
+    scored: list[tuple[float, str, bool]] = []
     for r in candidates:
         if not isinstance(r, dict):
             continue
@@ -682,14 +704,31 @@ def pick_run_id(
             rank = 1
         else:
             continue
-        if recovering and not run_query_matches(
-            fetch_run_messages(creds, rid), recovery_query
-        ):
-            continue
+        matched = False
+        if has_query:
+            matched = run_query_matches(
+                fetch_run_messages(creds, rid), recovery_query
+            )
+            # Finished runs must be this turn. An in-flight run older than
+            # the normal window (reload recovery) must match too. A run we
+            # just noticed may not have stored its user message yet — keep
+            # it, and prefer a match when one exists.
+            if status in ("completed", "succeeded") and not matched:
+                continue
+            if (
+                status in ("running", "created")
+                and created_epoch < tight_floor
+                and not matched
+            ):
+                continue
         score = rank * 1e12 + (created_epoch or 0.0)
-        if best is None or score > best[0]:
-            best = (score, rid)
-    return best[1] if best else None
+        scored.append((score, rid, matched))
+    if has_query and any(matched for _, _, matched in scored):
+        scored = [row for row in scored if row[2]]
+    if not scored:
+        return None
+    scored.sort(reverse=True)
+    return scored[0][1]
 
 
 def _parse_iso(s: str) -> float:
@@ -711,6 +750,9 @@ class TurnStreamWorker:
 
     LINGER_S = 60.0
     SEEK_TIMEOUT_S = 45.0
+    # Broca stays "processing" for the whole Letta turn. Keep looking that
+    # long instead of giving up at 45s with the user query still on screen.
+    SEEK_MAX_S = 300.0
     # After linger clears, ignore turn traps briefly — unstable hardcopy still
     # carries old LIVE-mode lines and was re-popping the query pane at rest.
     RETRIGGER_COOLDOWN_S = 12.0
@@ -1037,11 +1079,13 @@ class TurnStreamWorker:
 
         def runner() -> None:
             try:
-                if not broca_q:
+                resolved = clean_user_query(recovery_query) or broca_q
+                if not resolved:
                     query = fetch_broca_triggering_message(
                         self.agents_root, creds.agent_name
                     )
                     if query:
+                        resolved = query
                         self._set_query_and_waiting(
                             query=query,
                             run_id="",
@@ -1052,7 +1096,7 @@ class TurnStreamWorker:
                     creds,
                     since,
                     gen,
-                    recovery_query=recovery_query,
+                    recovery_query=resolved,
                 )
             except Exception as exc:  # noqa: BLE001
                 if not self._gen_ok(gen):
@@ -1121,6 +1165,14 @@ class TurnStreamWorker:
             )
             if run_id:
                 break
+            turn = fetch_broca_current_turn(self.agents_root, creds.agent_name)
+            deadline = extend_seek_deadline(
+                since=since,
+                now=time.time(),
+                deadline=deadline,
+                broca_active=bool(turn.get("active")),
+                max_s=self.SEEK_MAX_S,
+            )
             time.sleep(0.6)
         if self._stop_event.is_set() or not self._gen_ok(gen):
             return
@@ -1130,7 +1182,10 @@ class TurnStreamWorker:
                     return
                 self.state.status = "error"
                 self.state.error = "no Letta run found"
-                self.state.text = "Turn detected but no Letta run appeared in time."
+                self.state.text = with_query_header(
+                    "Turn detected but no Letta run appeared in time.",
+                    self.state.query,
+                )
                 self.state.lingering = True
                 self.state.linger_until = time.time() + 20.0
             self._notify()
