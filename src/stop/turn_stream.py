@@ -609,16 +609,33 @@ class TurnStreamWorker:
         with self._lock:
             self.state.run_id = run_id
             self.state.status = "streaming"
-        # Prefer showing the user query ASAP (often present before any step).
-        rows = fetch_run_messages(creds, run_id)
-        query = extract_user_query(rows)
+        # Show run-id waiting chrome immediately, then poll hard for the
+        # triggering user query *before* the first model step so the popup
+        # isn't blank while Letta thinks.
         self._set_query_and_waiting(
-            query=query, run_id=run_id, agent_name=creds.agent_name
+            query="", run_id=run_id, agent_name=creds.agent_name
         )
-        early = messages_to_text(rows)
+        query = ""
+        early = ""
+        wait_deadline = time.time() + 4.0
+        while time.time() < wait_deadline and not self._stop_event.is_set():
+            rows = fetch_run_messages(creds, run_id)
+            q = extract_user_query(rows)
+            early = messages_to_text(rows)
+            if q and q != query:
+                query = q
+                self._set_query_and_waiting(
+                    query=query, run_id=run_id, agent_name=creds.agent_name
+                )
+            if early:
+                break
+            # Keep looping until we have the query (or steps appear / timeout).
+            if query:
+                break
+            time.sleep(0.1)
         if early:
             with self._lock:
-                q = self.state.query
+                q = self.state.query or query
                 self.state.text = with_query_header(early, q)[-12000:]
             self._notify()
         self._consume_stream(creds, run_id)
@@ -702,7 +719,11 @@ class TurnStreamWorker:
                             _apply_text(msg_text)
                 except Exception:
                     pass
-                poll_stop.wait(0.7)
+                # Faster while still waiting so the query header lands before
+                # the first step when Letta is slow to emit chunks.
+                with self._lock:
+                    still_wait = _is_placeholder(self.state.text)
+                poll_stop.wait(0.2 if still_wait else 0.7)
 
         poller = threading.Thread(
             target=_poll_messages, name=f"turn-poll-{run_id[-8:]}", daemon=True
