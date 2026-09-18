@@ -152,9 +152,8 @@ class LiveLogFeed:
         """
         new_lines = lines_from_scrollback(text, limit=self.limit, width=self.width)
         if source_key != self._source_key:
-            # Don't clear a populated widget into an empty truncated capture.
-            if self._lines and not new_lines:
-                return "noop"
+            # Source identity is authoritative: never leave another agent's
+            # lines painted under the newly selected agent's title.
             self._source_key = source_key
             self._lines = new_lines
             log.clear()

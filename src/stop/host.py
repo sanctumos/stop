@@ -410,8 +410,8 @@ class LiveHost(HostBackend):
                                 )
                                 self._activity_epoch[w.screen_name] = activity
                                 w.last_activity_epoch = activity
-                            w.last_scrollback = text
-                            self._scroll_cache[w.screen_name] = (now, text)
+                        w.last_scrollback = text
+                        self._scroll_cache[w.screen_name] = (now, text)
                         hardcopied.add(screen_name)
             self._last_hardcopy_epoch = time.time()
             self._hardcopy_probe_cursor = next_probe_cursor
@@ -577,13 +577,18 @@ class LiveHost(HostBackend):
                     f.seek(-SCROLLBACK_MAX_BYTES, os.SEEK_END)
                 raw = f.read()
             text = _tail_text(raw.decode("utf-8", errors="replace"))
+            # A completed, nonzero hardcopy containing only whitespace is a
+            # legitimate blank screen (commonly stdout redirected to a file).
+            # It must clear this screen's old cache, not resurrect it.
+            if not text.strip():
+                return text
             # Reject obviously truncated tails when we already have a good buffer.
             if cached_text and text:
                 cached_n = cached_text.count("\n")
                 new_n = text.count("\n")
                 if cached_n >= 40 and new_n < max(10, cached_n // 3):
                     return cached_text
-            return text if text.strip() else cached_text
+            return text
         except (OSError, subprocess.TimeoutExpired):
             return cached_text
         finally:

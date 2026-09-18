@@ -101,3 +101,22 @@ def test_feed_ignores_empty_after_good_buffer():
     feed.sync(log, "one\ntwo\nthree\n", source_key="a")
     assert feed.sync(log, "", source_key="a") == "noop"
     assert writes.count("CLEAR") == 1
+
+
+def test_feed_source_switch_to_empty_clears_previous_agents_lines():
+    writes: list[str] = []
+
+    class FakeLog:
+        def clear(self) -> None:
+            writes.append("CLEAR")
+
+        def write(self, line: str, scroll_end: bool | None = None) -> None:
+            writes.append(line)
+
+    feed = LiveLogFeed(limit=50)
+    log = FakeLog()
+    assert feed.sync(log, "BRAMWELL STARTUP\n", source_key="bramwell") == "replace"
+    assert feed.sync(log, "\n\n", source_key="longfellow") == "replace"
+    assert writes == ["CLEAR", "BRAMWELL STARTUP", "CLEAR"]
+    assert feed._source_key == "longfellow"
+    assert feed._lines == []

@@ -26,3 +26,26 @@ def test_read_scrollback_keeps_cache_on_empty_file(tmp_path, monkeypatch):
     monkeypatch.setattr("stop.host.time.sleep", lambda _s: None)
     got = host.read_scrollback(screen)
     assert got == good
+
+
+def test_read_scrollback_treats_stable_whitespace_as_real_empty_screen(
+    tmp_path, monkeypatch
+):
+    host = LiveHost(home=tmp_path)
+    host.tmp = tmp_path / "stop-tmp"
+    host.tmp.mkdir()
+    screen = "broca-longfellow"
+    old = "old startup line\n" * 50
+    host._scroll_cache[screen] = (0.0, old)
+
+    def fake_run(cmd, **kwargs):
+        # GNU screen writes a small nonzero file for an intentionally blank
+        # terminal whose process redirects stdout/stderr to its own log.
+        Path(cmd[-1]).write_text("\n" * 24)
+        return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr("stop.host.subprocess.run", fake_run)
+    monkeypatch.setattr("stop.host.time.sleep", lambda _s: None)
+    got = host.read_scrollback(screen)
+    assert got.strip() == ""
+    assert "old startup line" not in got
