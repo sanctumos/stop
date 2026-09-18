@@ -14,6 +14,7 @@ from .activity import (
     scrollback_delta_is_noise_only,
 )
 from .discovery import build_agents
+from .pulse import AgentPulse
 from .metrics import METRICS, calling_from_ui_thread
 from .models import (
     EXCLUDED_SCREEN_NAMES,
@@ -212,6 +213,7 @@ class LiveHost(HostBackend):
         self.hardcopy_max_screens = 6
         self.hardcopy_probe_slots = 3
         self._hardcopy_probe_cursor = 0
+        self._pulse = AgentPulse()
         self._last_hardcopy_epoch = 0.0
         # Ordered focus: selected Broca → Active Now → Letta → secondary (#4062).
         self._focus_order: list[str] = []
@@ -510,6 +512,7 @@ class LiveHost(HostBackend):
             net_bytes_recv=recv,
             net_up_bps=up_bps,
             net_down_bps=down_bps,
+            pulses=self._pulse.observe(agents, now),
         )
         METRICS.record_snapshot(time.perf_counter() - t0)
         return snap

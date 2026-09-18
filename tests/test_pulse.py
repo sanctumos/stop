@@ -1,0 +1,77 @@
+"""Relative per-agent activity sparklines."""
+
+from stop.models import Agent, Window, WindowState
+from stop.pulse import GLYPHS, AgentPulse, activity_text, new_meaningful_lines
+
+
+def _agent(name: str, text: str, *, log: str = "") -> Agent:
+    windows = [
+        Window(
+            id=f"{name}/broca",
+            label=f"broca-{name}",
+            screen_name=f"broca-{name}",
+            state=WindowState.RUNNING,
+            last_scrollback=text,
+        )
+    ]
+    if log:
+        windows.append(
+            Window(
+                id=f"{name}/run-log",
+                label="run log",
+                log_path=f"/tmp/{name}.log",
+                state=WindowState.RUNNING,
+                last_scrollback=log,
+            )
+        )
+    return Agent(name=name, windows=windows)
+
+
+def test_blank_screen_uses_that_agents_run_log_only():
+    agent = _agent("longfellow", "\n\n", log="Retrieved 0 messages from web chat API\n")
+    assert "web chat API" in activity_text(agent)
+    assert activity_text(_agent("bramwell", "Bramwell startup\n")) == "Bramwell startup\n"
+
+
+def test_polling_floor_stays_flat_while_burst_rises():
+    pulse = AgentPulse()
+    now = 1_000.0
+    polling = "[2026-09-18 12:00:00] INFO Retrieved 0 messages from web chat API\n"
+    pulse.observe([_agent("porter", polling)], now)
+    for step in range(1, 8):
+        polling += (
+            f"[2026-09-18 12:00:{step:02d}] INFO "
+            "Retrieved 0 messages from web chat API\n"
+        )
+        rendered = pulse.observe([_agent("porter", polling)], now + step)["porter"]
+    assert set(rendered) == {GLYPHS[0]}
+
+    quiet = "[2026-09-18 12:00:00] INFO idle\n"
+    pulse.observe([_agent("athena", quiet)], now)
+    burst = quiet + "[2026-09-18 12:00:05] INFO telegram inbound from Mark\n"
+    rendered = pulse.observe([_agent("athena", burst)], now + 5)["athena"]
+    assert rendered[-1] != GLYPHS[0]
+
+
+def test_rolling_hardcopy_counts_only_the_new_line():
+    old = "\n".join(f"[2026-09-18 12:00:{i:02d}] INFO telegram inbound {i}" for i in range(10))
+    new = "\n".join(f"[2026-09-18 12:00:{i:02d}] INFO telegram inbound {i}" for i in range(1, 11))
+    assert new_meaningful_lines(old + "\n", new + "\n") == 1
+
+
+def test_agents_do_not_share_scale_and_old_bursts_decay():
+    pulse = AgentPulse(window_s=30)
+    now = 2_000.0
+    base = "[2026-09-18 12:00:00] INFO idle\n"
+    athena = _agent("athena", base)
+    monday = _agent("monday", base)
+    pulse.observe([athena, monday], now)
+    athena = _agent(
+        "athena",
+        base + "[2026-09-18 12:00:02] INFO telegram inbound\n",
+    )
+    hot = pulse.observe([athena, monday], now + 2)
+    assert hot["athena"][-1] != GLYPHS[0]
+    assert set(hot["monday"]) == {GLYPHS[0]}
+    cooled = pulse.observe([athena, monday], now + 40)
+    assert set(cooled["athena"]) == {GLYPHS[0]}

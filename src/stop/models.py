@@ -110,3 +110,4 @@ class HostSnapshot:
     # Instantaneous rates (bytes/sec), btop-style — not lifetime counters.
     net_up_bps: float = 0.0
     net_down_bps: float = 0.0
+    pulses: dict[str, str] = field(default_factory=dict)

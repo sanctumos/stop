@@ -137,6 +137,7 @@ class HelpScreen(ModalScreen[None]):
             "?            this help\n"
             "q            quit\n\n"
             "No restart button — cron restarts agents.\n"
+            "Selector bars show each agent's own recent volume, not health.\n"
             "Active Now follows human/agent dialogue — not otto_bridge chatter.\n"
             "Bottom row: Active Now (left) + Letta console (right).\n"
             "Turn stream: Broca turn-start → Letta /v1/runs/{id}/stream;\n"
@@ -215,6 +216,7 @@ class AgentList(Static):
         # Authoritative selection — index is derived (#4067).
         self.selected_name: str | None = None
         self._fell_back = False
+        self.pulses: dict[str, str] = {}
 
     def set_agents(self, agents: list[Agent]) -> None:
         from .selection import resolve_agent_selection
@@ -282,7 +284,11 @@ class AgentList(Static):
                 uptime = "-"
             # Compact one-liner for ~28 usable cols.
             label = agent_selector_label(a.name)
-            lines.append(f"{mark} [{style}]{label}[/{style}] {badge} {uptime}")
+            pulse = self.pulses.get(a.name, "")
+            pulse_bit = f" {pulse}" if pulse else ""
+            lines.append(
+                f"{mark} [{style}]{label}[/{style}] {badge} {uptime}{pulse_bit}"
+            )
         title = "agents"
         if self.filter:
             title += f" /{self.filter}"
@@ -620,7 +626,7 @@ class StopApp(App[None]):
     #body { height: 1fr; }
     #row { height: 2fr; }
     #agents {
-        width: 30; height: 100%;
+        width: 36; height: 100%;
         border: solid $accent; border-title-align: left;
         padding: 0 1;
     }
@@ -688,7 +694,7 @@ class StopApp(App[None]):
         padding: 1 2;
     }
 
-    Screen.medium #agents { width: 26; }
+    Screen.medium #agents { width: 34; }
 
     Screen.narrow #row { layout: vertical; }
     Screen.narrow #bottom { layout: vertical; }
@@ -971,6 +977,7 @@ class StopApp(App[None]):
             self.query_one(HostStrip).show(snap)
             agents_w = self.query_one(AgentList)
             agents_w.filter = self._filter
+            agents_w.pulses = snap.pulses
             agents_w.set_agents(snap.agents)
             selected = agents_w.selected()
             pane = self.query_one(WindowPane)
