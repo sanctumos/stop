@@ -49,6 +49,19 @@ python3 -m venv .venv && .venv/bin/pip install -e .[dev]
 
 ## Keys
 
-`↑↓`/`jk` select agent · `Enter`/`Esc` expand pane · `Tab` cycle panes · `a` Active Now ·
-`l` Letta · `t` turn stream · `f` follow-lock · `/` filter · `?` help · `q` quit.
+| Key | Action |
+|-----|--------|
+| `↑↓` / `j` `k` | Select agent |
+| `Enter` / `Esc` | Expand / collapse window pane |
+| `Tab` | Cycle panes (narrow: agents → windows → Active Now → Letta) |
+| `a` / `l` | Jump Active Now / Letta |
+| `t` | Toggle turn-stream overlay |
+| `f` | Follow-lock / release Active Now |
+| `PgUp` / `PgDn` | Scroll focused log (holds follow-tail) |
+| `Home` / `End` | Log start / resume follow-tail at end |
+| `/` | Filter agents |
+| `?` | Help |
+| `q` | Quit |
+
+Chrome strip shows layout/page name, active turn, and `scroll:held` when follow-tail is off.
 `Ctrl+S` is never bound.

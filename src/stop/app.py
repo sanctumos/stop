@@ -126,6 +126,8 @@ class HelpScreen(ModalScreen[None]):
             "l            jump to Letta pane\n"
             "t            toggle turn-stream overlay (default ON)\n"
             "f            follow-lock / release Active Now\n"
+            "PgUp/PgDn    scroll focused log (holds follow-tail)\n"
+            "Home/End     jump log start / resume follow-tail at end\n"
             "/            filter agents\n"
             "?            this help\n"
             "q            quit\n\n"
@@ -294,6 +296,7 @@ class WindowPane(Vertical):
         self._turn_body: str | None = None
         self._empty_kind: str | None = None  # none|select|empty — avoid repeat clears
         self._window_fell_back = False
+        self.follow_tail = True
 
     def compose(self) -> ComposeResult:
         yield Static(id="win-meta")
@@ -408,7 +411,9 @@ class WindowPane(Vertical):
         # Live log = selected window only; append new lines, never rewrite on idle.
         # Do not include expanded in the key — Enter/Esc must not clear the log (#4067).
         source_key = f"{agent.name}:{w.id}"
-        self._feed.sync(log, w.last_scrollback, source_key=source_key)
+        self._feed.sync(
+            log, w.last_scrollback, source_key=source_key, follow=self.follow_tail
+        )
 
     def show_turn(self, state: TurnStreamState) -> None:
         """Show/hide the turn-stream overlay; append-only body updates (#4065)."""
@@ -596,7 +601,7 @@ class StopApp(App[None]):
     CSS = """
     Screen { layout: vertical; }
     #host { height: 2; dock: top; background: $boost; padding: 0 1; }
-    #events { height: 1; dock: bottom; color: $text-muted; padding: 0 1; }
+    #events { height: 1; color: $text-muted; padding: 0 1; }
     #body { height: 1fr; }
     #row { height: 2fr; }
     #agents {
@@ -646,7 +651,15 @@ class StopApp(App[None]):
     #agents:focus, #windows:focus, #active:focus, #letta:focus {
         border: heavy $success;
     }
-    #filter { dock: bottom; display: none; height: 3; }
+    #chrome { height: 1; dock: top; color: $text-muted; padding: 0 1; }
+    #bottom-chrome {
+        dock: bottom;
+        height: auto;
+        layout: vertical;
+        margin-bottom: 1;
+    }
+    #events { height: 1; color: $text-muted; padding: 0 1; }
+    #filter { display: none; height: 3; }
     #filter.visible { display: block; }
 
     HelpScreen { align: center middle; background: $background 80%; }
@@ -683,13 +696,17 @@ class StopApp(App[None]):
         Binding("k,up", "up", "up", show=False),
         Binding("enter", "expand", "expand"),
         Binding("escape", "collapse", "collapse", show=False),
-        Binding("tab", "cycle", "cycle", show=False),
+        Binding("tab", "cycle", "cycle", show=False, priority=True),
         Binding("a", "focus_active", "active"),
         Binding("l", "focus_letta", "letta"),
         Binding("t", "toggle_turn_stream", "turns"),
         Binding("f", "toggle_follow", "follow"),
         Binding("question_mark", "help", "help"),
         Binding("slash", "filter", "filter"),
+        Binding("pageup", "log_page_up", "pgup", show=False),
+        Binding("pagedown", "log_page_down", "pgdn", show=False),
+        Binding("home", "log_home", "home", show=False),
+        Binding("end", "log_end", "end", show=False),
     ]
 
     def __init__(self, host: HostBackend, config: StopConfig | None = None):
@@ -708,6 +725,7 @@ class StopApp(App[None]):
         self._turn: TurnStreamWorker | None = None
         self._turn_coalesce = False
         self._turn_dirty = False
+        self._turn_was_active = False
         self._collector = HostCollector(host, on_update=self._on_collector_update)
         if isinstance(self.host, LiveHost):
             self.host.hardcopy_interval_s = float(self.config.refresh_hardcopy_s)
@@ -741,6 +759,8 @@ class StopApp(App[None]):
     def _flush_turn_paint(self) -> None:
         self._turn_coalesce = False
         self._paint_turn_from_worker()
+        self._maybe_narrow_turn_reveal()
+        self._update_chrome()
         if self._turn_dirty:
             self._turn_dirty = False
             self._turn_coalesce = True
@@ -754,9 +774,58 @@ class StopApp(App[None]):
         except Exception:
             pass
 
+    def _update_chrome(self) -> None:
+        """Persistent page / turn indicator (#4070)."""
+        try:
+            chrome = self.query_one("#chrome", Static)
+        except Exception:
+            return
+        bits: list[str] = []
+        if "narrow" in self.screen.classes:
+            bits.append(f"page:{self._narrow_page}")
+        elif "medium" in self.screen.classes:
+            bits.append("layout:medium")
+        else:
+            bits.append("layout:wide")
+        if self._turn is not None:
+            st = self._turn.snapshot()
+            if st.active and st.agent_name:
+                bits.append(f"turn:{st.agent_name}/{st.status}")
+            if st.pending_agents:
+                bits.append("pending:" + ",".join(st.pending_agents[:3]))
+        try:
+            pane = self.query_one(WindowPane)
+            if not pane.follow_tail:
+                bits.append("scroll:held")
+        except Exception:
+            pass
+        _paint(chrome, " · ".join(bits))
+
+    def _maybe_narrow_turn_reveal(self) -> None:
+        """On narrow screens, open windows page when a turn starts (#4070)."""
+        if self._turn is None:
+            return
+        st = self._turn.snapshot()
+        active = bool(st.active and st.agent_name)
+        started = active and not self._turn_was_active
+        self._turn_was_active = active
+        if not started:
+            return
+        if "narrow" not in self.screen.classes:
+            return
+        if self._narrow_page == "windows":
+            return
+        self._narrow_page = "windows"
+        self._apply_breakpoint()
+        try:
+            self.query_one(WindowPane).focus()
+        except Exception:
+            pass
+
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
         yield HostStrip(id="host")
+        yield Static(id="chrome")
         with Vertical(id="body"):
             with Horizontal(id="row"):
                 yield AgentList(id="agents")
@@ -764,9 +833,11 @@ class StopApp(App[None]):
             with Horizontal(id="bottom"):
                 yield ActiveNowPane(id="active")
                 yield LettaPane(id="letta")
-        yield EventStrip(id="events")
-        yield Input(placeholder="filter agents… (Enter apply, Esc cancel)", id="filter")
+        with Vertical(id="bottom-chrome"):
+            yield EventStrip(id="events")
+            yield Input(placeholder="filter agents… (Enter apply, Esc cancel)", id="filter")
         yield Footer()
+
 
     def on_mount(self) -> None:
         import threading
@@ -916,6 +987,8 @@ class StopApp(App[None]):
             )
             self.query_one(LettaPane).show(self._letta_window(snap))
             self._tick_turn_stream(selected)
+            self._maybe_narrow_turn_reveal()
+            self._update_chrome()
             if err:
                 self.query_one(EventStrip).update(
                     f"[red]refresh error: {_plain(err[:80])}[/red]"
@@ -1086,6 +1159,93 @@ class StopApp(App[None]):
             return
         nxt = ids[(ids.index(current) + 1) % len(ids)]
         widgets[nxt].focus()
+
+    def action_log_page_up(self) -> None:
+        log = self._focused_log()
+        if log is None:
+            return
+        self._hold_follow_if_win_log(log)
+        try:
+            log.scroll_page_up(animate=False)
+        except Exception:
+            pass
+        self._update_chrome()
+
+    def action_log_page_down(self) -> None:
+        log = self._focused_log()
+        if log is None:
+            return
+        try:
+            log.scroll_page_down(animate=False)
+        except Exception:
+            pass
+        # Re-arm follow only when we land at the bottom.
+        if self._log_at_end(log):
+            self._resume_follow_if_win_log(log)
+        else:
+            self._hold_follow_if_win_log(log)
+        self._update_chrome()
+
+    def action_log_home(self) -> None:
+        log = self._focused_log()
+        if log is None:
+            return
+        self._hold_follow_if_win_log(log)
+        try:
+            log.scroll_home(animate=False)
+        except Exception:
+            pass
+        self._update_chrome()
+
+    def action_log_end(self) -> None:
+        log = self._focused_log()
+        if log is None:
+            return
+        self._resume_follow_if_win_log(log)
+        try:
+            log.scroll_end(animate=False)
+        except Exception:
+            pass
+        self._update_chrome()
+
+    def _focused_log(self) -> RichLog | None:
+        node = self.focused
+        while node is not None:
+            if isinstance(node, RichLog):
+                return node
+            # Pane focus → primary log child.
+            if isinstance(node, WindowPane):
+                try:
+                    return node.query_one("#win-log", RichLog)
+                except Exception:
+                    return None
+            if isinstance(node, ActiveNowPane):
+                try:
+                    return node.query_one("#active-log", RichLog)
+                except Exception:
+                    return None
+            if isinstance(node, LettaPane):
+                try:
+                    return node.query_one("#letta-log", RichLog)
+                except Exception:
+                    return None
+            node = node.parent
+        return None
+
+    def _hold_follow_if_win_log(self, log: RichLog) -> None:
+        if getattr(log, "id", None) == "win-log":
+            self.query_one(WindowPane).follow_tail = False
+
+    def _resume_follow_if_win_log(self, log: RichLog) -> None:
+        if getattr(log, "id", None) == "win-log":
+            self.query_one(WindowPane).follow_tail = True
+
+    @staticmethod
+    def _log_at_end(log: RichLog) -> bool:
+        try:
+            return bool(log.is_vertical_scroll_end)
+        except Exception:
+            return True
 
     def action_toggle_follow(self) -> None:
         if self._snap is None:

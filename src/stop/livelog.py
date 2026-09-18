@@ -96,8 +96,12 @@ class LiveLogFeed:
         self._source_key = None
         self._lines = []
 
-    def sync(self, log: RichLog, text: str, *, source_key: str) -> str:
-        """Apply scrollback `text` for `source_key`. Returns mode used."""
+    def sync(self, log: RichLog, text: str, *, source_key: str, follow: bool = True) -> str:
+        """Apply scrollback `text` for `source_key`. Returns mode used.
+
+        When ``follow`` is False, append/replace without scrolling to end so
+        manual scrollback stays put (#4070).
+        """
         new_lines = lines_from_scrollback(text, limit=self.limit, width=self.width)
         if source_key != self._source_key:
             # Don't clear a populated widget into an empty truncated capture.
@@ -107,19 +111,19 @@ class LiveLogFeed:
             self._lines = new_lines
             log.clear()
             for ln in new_lines:
-                log.write(ln, scroll_end=True)
+                log.write(ln, scroll_end=follow)
             return "replace"
         mode, chunk = diff_log_lines(self._lines, new_lines)
         if mode == "noop":
             return "noop"
         if mode == "append":
             for ln in chunk:
-                # Only scroll when real lines arrive — never on idle ticks.
-                log.write(ln, scroll_end=True)
+                # Only scroll when following — never on idle ticks or manual scrollback.
+                log.write(ln, scroll_end=follow)
             self._lines = new_lines
             return "append"
         log.clear()
         for ln in new_lines:
-            log.write(ln, scroll_end=True)
+            log.write(ln, scroll_end=follow)
         self._lines = new_lines
         return "replace"
