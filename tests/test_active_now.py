@@ -151,6 +151,31 @@ def test_newer_one_line_beats_older_many_dialogue_hits():
     assert pick_active_now(agents).id == "aaa/broca"
 
 
+def test_newer_meaningful_signal_beats_stale_dialogue():
+    now = time.time()
+    stale_dialogue = Window(
+        id="athena/broca",
+        label="broca-athena",
+        screen_name="broca-athena",
+        state=WindowState.RUNNING,
+        last_activity_epoch=now - 1200,
+        last_scrollback="telegram inbound from Mark\n",
+    )
+    current_turn = Window(
+        id="ada/broca",
+        label="broca-ada",
+        screen_name="broca-ada",
+        state=WindowState.RUNNING,
+        last_activity_epoch=now,
+        last_scrollback="runtime.core.agent: Stream processing timed out\n",
+    )
+    agents = [
+        Agent(name="athena", cron_managed=True, windows=[stale_dialogue]),
+        Agent(name="ada", cron_managed=True, windows=[current_turn]),
+    ]
+    assert pick_active_now(agents).id == "ada/broca"
+
+
 def test_equal_epoch_tie_breaks_by_stable_id():
     now = time.time()
     a = Window(

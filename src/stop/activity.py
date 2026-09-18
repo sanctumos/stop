@@ -150,12 +150,12 @@ def rank_active_windows(
     *,
     exclude_screens: frozenset[str] | None = None,
 ) -> list[Window]:
-    """Windows sorted for Active Now: class → meaningful time → hits → id.
+    """Windows sorted for Active Now: meaningful time → class → hits → id.
 
-    Dialogue beats other beats noise. Within a class, the most recent
-    *meaningful* ``last_activity_epoch`` wins (noise deltas must not advance
-    that epoch — see host hardcopy). Dialogue-hit count is only a tie-breaker;
-    stable ``window.id`` breaks remaining ties so equal timestamps do not flip.
+    The most recent *meaningful* ``last_activity_epoch`` wins. Noise receives
+    epoch zero, so fresh bridge/HTTP chatter cannot steal the pane. Class and
+    dialogue-hit count only break timestamp ties; stable ``window.id`` breaks
+    remaining ties so equal timestamps do not flip.
     """
     exclude = exclude_screens if exclude_screens is not None else EXCLUDED_SCREEN_NAMES
     candidates: list[Window] = []
@@ -174,10 +174,10 @@ def rank_active_windows(
 
     def _key(w: Window) -> tuple:
         kind, hits, _ = classify_scrollback(w.last_scrollback)
-        # Noise-only windows sort to the bottom even if their epoch is newest.
+        # Noise-only windows sort to the bottom even if their raw capture is newest.
         epoch = w.last_activity_epoch if kind >= KIND_OTHER else 0.0
         # Ascending on negated primaries + id → deterministic, no flip-flops.
-        return (-kind, -epoch, -hits, w.id)
+        return (-epoch, -kind, -hits, w.id)
 
     candidates.sort(key=_key)
     return candidates
