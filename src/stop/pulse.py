@@ -3,11 +3,21 @@
 from __future__ import annotations
 
 import math
+import re
 from collections import Counter, deque
 
 from .activity import KIND_NOISE, classify_line
 from .livelog import unwrap_screen_hardcopy
 from .models import Agent
+
+_TURN_OPEN = re.compile(
+    r"Processing message in LIVE mode|Coalesced inbound|Attaching user core block",
+    re.I,
+)
+_TURN_CLOSE = re.compile(
+    r"Routing response through|Detaching core block|turn timed out|Stream processing timed out",
+    re.I,
+)
 
 # tty1 on moya uses the 512-glyph Uni2-Fixed16 console font. It has █ ░ ▒
 # and box drawing, and it does not have the eighth-blocks (▁▂▃…). Missing
@@ -55,17 +65,20 @@ def new_meaningful_lines(old: str, new: str) -> int:
     return arrived
 
 
-def _percentile(values: list[float], p: float) -> float:
-    if not values:
-        return 0.0
-    ordered = sorted(values)
-    if len(ordered) == 1:
-        return ordered[0]
-    index = (len(ordered) - 1) * p
-    low = int(index)
-    high = min(low + 1, len(ordered) - 1)
-    fraction = index - low
-    return ordered[low] * (1.0 - fraction) + ordered[high] * fraction
+def turn_open(text: str) -> bool:
+    """True while Broca has started a turn and not yet finished it.
+
+    Letta can think for minutes without writing another log line. The meter
+    has to stay up through that silence.
+    """
+    lines = [ln for ln in unwrap_screen_hardcopy(text) if ln.strip()][-40:]
+    open_ = False
+    for line in lines:
+        if _TURN_CLOSE.search(line):
+            open_ = False
+        elif _TURN_OPEN.search(line):
+            open_ = True
+    return open_
 
 
 class AgentPulse:
@@ -80,8 +93,6 @@ class AgentPulse:
     ) -> None:
         self.width = width
         self.window_s = window_s
-        self._floor: dict[str, float] = {}
-        self._excess: dict[str, deque[float]] = {}
         self._events: dict[str, deque[tuple[float, float]]] = {}
         self._text: dict[str, str] = {}
         self._seen_at: dict[str, float] = {}
@@ -110,31 +121,22 @@ class AgentPulse:
 
     def _observe_one(self, name: str, text: str, now: float) -> None:
         previous = self._text.get(name)
-        seen = self._seen_at.get(name, now)
         self._text[name] = text
         self._seen_at[name] = now
         if previous is None:
-            self._floor.setdefault(name, 0.0)
+            if turn_open(text):
+                self._events.setdefault(name, deque(maxlen=self._history)).append((now, 1.0))
             return
-        elapsed = max(0.25, now - seen)
-        rate = new_meaningful_lines(previous, text) / elapsed
-        floor = self._floor.get(name, 0.0)
-        # Fall quickly, rise slowly: a steady polling floor must not become a burst.
-        alpha = 0.35 if rate <= floor else 0.03
-        floor = (1.0 - alpha) * floor + alpha * rate
-        self._floor[name] = floor
-        excess = max(0.0, rate - floor)
-        samples = self._excess.setdefault(name, deque(maxlen=self._history))
-        samples.append(excess)
-        scale = _percentile(list(samples), 0.9)
-        level = 0.0 if scale <= 1e-9 else min(1.0, excess / scale)
+        arrived = new_meaningful_lines(previous, text)
+        # A real line is a real line. Do not scale it down against this
+        # agent's own recent volume — that hid an in-flight Athena turn.
+        # An open turn stays lit even when the log goes quiet mid-think.
+        level = 1.0 if turn_open(text) or arrived > 0 else 0.0
         events = self._events.setdefault(name, deque(maxlen=self._history))
         events.append((now, level))
 
     def _forget(self, name: str) -> None:
         for store in (
-            self._floor,
-            self._excess,
             self._events,
             self._text,
             self._seen_at,

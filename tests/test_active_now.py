@@ -39,6 +39,22 @@ def test_bridge_write_is_noise():
     )
     assert classify_line("Retrieved 0 inbox messages") == KIND_NOISE
     assert classify_line("Retrieved 2 partner-bridge messages") != KIND_NOISE
+    assert (
+        classify_line(
+            'httpx: HTTP Request: POST http://localhost:8284/v1/agents/x/messages "HTTP/1.1 200 OK"'
+        )
+        != KIND_NOISE
+    )
+    assert (
+        classify_line("httpx: HTTP Request: GET http://127.0.0.1:8284/v1/health")
+        == KIND_NOISE
+    )
+    assert (
+        classify_line(
+            "HTTP Request: PATCH http://localhost:8284/v1/agents/x HTTP/1.1 200 OK"
+        )
+        == KIND_NOISE
+    )
 
 
 def test_telegram_inbound_is_dialogue():

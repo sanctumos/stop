@@ -18,10 +18,10 @@ _NOISE_RES = [
         # Empty inbox poll. Each Broca phrases this differently
         # ("web chat API" vs "partner-bridge"); only a non-zero retrieve counts.
         r"Retrieved 0\b.*\bmessages\b",
-        r"httpx: HTTP Request:.*(?:localhost|127\.0\.0\.1):8284",
+        # Idle Letta polls and core-block plumbing. POST /messages is the turn.
+        r"HTTP Request: (?:GET|PATCH) .*(?:localhost|127\.0\.0\.1):8284",
         r"plugins\.\w+_vernal_webchat\.api_client",
         r"runtime\.core\.queue:.*attached core block",
-        r"HTTP/1\.1 200 OK",
         r"systemctl --user is-active",
     )
 ]

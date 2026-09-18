@@ -83,6 +83,25 @@ def test_rolling_hardcopy_counts_only_the_new_line():
     assert new_meaningful_lines(old + "\n", new + "\n") == 1
 
 
+def test_open_turn_stays_lit_while_letta_is_quiet():
+    pulse = AgentPulse()
+    now = 5_000.0
+    text = (
+        "[2026-09-18 15:09:02] INFO Coalesced inbound queued message_id=6911\n"
+        "[2026-09-18 15:09:02] INFO Processing message in LIVE mode\n"
+    )
+    agent = _agent("athena", text)
+    assert pulse.observe([agent], now)["athena"][-1] == GLYPHS[-1]
+    # Same screen 20s later: she is still inside the Letta call.
+    assert pulse.observe([agent], now + 20)["athena"][-1] == GLYPHS[-1]
+    closed = text + (
+        "[2026-09-18 15:09:40] INFO Routing response through telegram handler\n"
+    )
+    pulse.observe([_agent("athena", closed)], now + 21)
+    faded = pulse.observe([_agent("athena", closed)], now + 70)["athena"]
+    assert set(faded) == {GLYPHS[0]}
+
+
 def test_agents_do_not_share_scale_and_old_bursts_decay():
     pulse = AgentPulse(window_s=30)
     now = 2_000.0
