@@ -47,6 +47,31 @@ def test_scrollback_ignores_dequeue_alone():
     assert scrollback_signals_turn_start(prev, new) is False
 
 
+def test_scrollback_ignores_old_live_mode_on_unstable_hardcopy():
+    """Hardcopy rewrite with old LIVE lines still in the tail must not re-trap."""
+    live = (
+        "[2026-09-17 20:19:47] INFO Processing message in LIVE mode\n"
+        "[2026-09-17 20:19:47] INFO Processing message with attached core block\n"
+        "[2026-09-17 20:20:05] INFO Routing response through otto_bridge handler\n"
+    )
+    prev = "earlier\n" + live
+    # Unstable: dropped 'earlier', same LIVE lines still present, plus noise.
+    new = live + "[2026-09-17 20:21:00] INFO some keepalive\n"
+    assert scrollback_signals_turn_start(prev, new) is False
+
+
+def test_scrollback_detects_new_live_mode_amid_unstable_hardcopy():
+    prev = (
+        "[2026-09-17 20:19:47] INFO Processing message in LIVE mode\n"
+        "[2026-09-17 20:20:05] INFO Routing response through otto_bridge handler\n"
+    )
+    new = (
+        "[2026-09-17 20:20:05] INFO Routing response through otto_bridge handler\n"
+        "[2026-09-17 20:25:00] INFO Processing message in LIVE mode\n"
+    )
+    assert scrollback_signals_turn_start(prev, new) is True
+
+
 def test_format_assistant_and_think():
     assert "hello" in format_stream_event(
         {"message_type": "assistant_message", "content": "hello"}

@@ -147,37 +147,15 @@ class HelpScreen(ModalScreen[None]):
             self.dismiss()
 
 
-_SPARK_BLOCKS = "▁▂▃▄▅▆▇█"
-
-
-def _spark(history: list[float], *, width: int = 24, vmax: float | None = None) -> str:
-    """Render a sparkline from history samples (newest last)."""
-    if not history:
-        return "▁" * width
-    samples = history[-width:]
-    pad = width - len(samples)
-    top = vmax if vmax and vmax > 0 else max(max(samples), 1e-9)
-    out = []
-    for v in samples:
-        idx = int((max(0.0, min(v, top)) / top) * (len(_SPARK_BLOCKS) - 1))
-        out.append(_SPARK_BLOCKS[idx])
-    return "▁" * pad + "".join(out)
-
-
 class HostStrip(Static):
-    """btop-ish host meters: bars + rolling sparklines for CPU and net."""
-
-    HISTORY = 60
+    """Host meters: continuum bars + rates (no block-glyph sparklines)."""
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self._cpu_hist: list[float] = []
-        self._up_hist: list[float] = []
-        self._down_hist: list[float] = []
 
     @staticmethod
     def _bar(pct: float, width: int = 14) -> str:
-        """btop-style continuum bar (█ / ░) — avoid ■ which fonts draw as diamonds."""
+        """Filled █ + empty ─ (shade/block grit reads as diamonds in many fonts)."""
         pct = max(0.0, min(100.0, pct))
         filled = int(round((pct / 100.0) * width))
         return "█" * filled + "─" * (width - filled)
@@ -200,26 +178,19 @@ class HostStrip(Static):
         if mem_pct <= 0 and snap.mem_total_gib > 0:
             mem_pct = 100.0 * snap.mem_used_gib / snap.mem_total_gib
 
-        self._cpu_hist = (self._cpu_hist + [snap.cpu_percent])[-self.HISTORY:]
-        self._up_hist = (self._up_hist + [snap.net_up_bps])[-self.HISTORY:]
-        self._down_hist = (self._down_hist + [snap.net_down_bps])[-self.HISTORY:]
-
         cpu_style = self._pressure_style(snap.cpu_percent)
         ram_style = self._pressure_style(mem_pct)
-        cpu_spark = _spark(self._cpu_hist, vmax=100.0)
-        up_spark = _spark(self._up_hist)
-        down_spark = _spark(self._down_hist)
 
         line1 = (
             f"[b]CPU[/b] [{cpu_style}]{self._bar(snap.cpu_percent)}[/{cpu_style}] "
-            f"{snap.cpu_percent:5.1f}%  [{cpu_style}]{cpu_spark}[/{cpu_style}]  "
+            f"{snap.cpu_percent:5.1f}%  "
             f"load [b]{load[0]:.2f}[/b] {load[1]:.2f} {load[2]:.2f}"
         )
         line2 = (
             f"[b]RAM[/b] [{ram_style}]{self._bar(mem_pct)}[/{ram_style}] "
             f"{snap.mem_used_gib:4.1f}/{snap.mem_total_gib:.1f}G {mem_pct:3.0f}%  "
-            f"[b]NET[/b] [cyan]↑{self._rate(snap.net_up_bps)}[/cyan] [cyan]{up_spark}[/cyan] "
-            f"[magenta]↓{self._rate(snap.net_down_bps)}[/magenta] [magenta]{down_spark}[/magenta]"
+            f"[b]NET[/b] [cyan]↑{self._rate(snap.net_up_bps)}[/cyan] "
+            f"[magenta]↓{self._rate(snap.net_down_bps)}[/magenta]"
         )
         _paint(self, line1 + "\n" + line2)
 

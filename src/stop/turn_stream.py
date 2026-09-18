@@ -95,7 +95,13 @@ def load_agent_creds(agents_root: Path, agent_name: str) -> LettaAgentCreds | No
 
 
 def scrollback_signals_turn_start(prev: str, new: str) -> bool:
-    """True when new Broca scrollback added a turn-start line."""
+    """True when new Broca scrollback added a turn-start line.
+
+    Unstable hardcopy often rewrites the tail without a pure append. Falling
+    back to ``new_lines[-12:]`` re-armed the popup at rest whenever those
+    lines still contained an old ``LIVE mode`` row. Only lines that are not
+    already in ``prev`` count.
+    """
     if not (new or "").strip():
         return False
     # hardcopy can embed NULs / C1 controls — normalize before compare.
@@ -108,7 +114,11 @@ def scrollback_signals_turn_start(prev: str, new: str) -> bool:
     if len(new_lines) >= len(old_lines) and new_lines[: len(old_lines)] == old_lines:
         delta = new_lines[len(old_lines) :]
     else:
-        delta = new_lines[-12:]
+        old_set = set(old_lines)
+        delta = [ln for ln in new_lines if ln not in old_set]
+        if not delta:
+            return False
+        delta = delta[-20:]
     return any(
         any(r.search(ln) for r in _TURN_START_RES) for ln in delta if ln.strip()
     )
@@ -479,6 +489,9 @@ class TurnStreamWorker:
 
     LINGER_S = 60.0
     SEEK_TIMEOUT_S = 45.0
+    # After linger clears, ignore turn traps briefly — unstable hardcopy still
+    # carries old LIVE-mode lines and was re-popping the query pane at rest.
+    RETRIGGER_COOLDOWN_S = 12.0
 
     def __init__(
         self,
@@ -496,6 +509,7 @@ class TurnStreamWorker:
         self._stop_event = threading.Event()
         self._seek_agent: str | None = None
         self._seek_since: float = 0.0
+        self._cooldown_until: float = 0.0
 
     def set_enabled(self, enabled: bool) -> None:
         with self._lock:
@@ -564,6 +578,7 @@ class TurnStreamWorker:
                 self.state.saw_waiting_query = False
                 self.state.run_id = ""
                 self.state.agent_name = ""
+                self._cooldown_until = now + self.RETRIGGER_COOLDOWN_S
             # Advance scroll cursor so lagging Broca lines (POST 200, detach)
             # that arrived during linger do not look like a fresh turn start.
             if selected_agent and (broca_scrollback or "").strip():
@@ -585,6 +600,12 @@ class TurnStreamWorker:
             return
 
         if not selected_agent:
+            return
+
+        if now < self._cooldown_until:
+            # Still advance cursor so cooldown exit doesn't see a giant delta.
+            if (broca_scrollback or "").strip():
+                self._prev_scroll[selected_agent] = broca_scrollback
             return
 
         new = broca_scrollback or ""
