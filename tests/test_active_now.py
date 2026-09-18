@@ -31,6 +31,12 @@ def test_bridge_write_is_noise():
         == KIND_NOISE
     )
     assert classify_line("Retrieved 0 messages from web chat API") == KIND_NOISE
+    assert (
+        classify_line(
+            "plugins.rico_kitchen_webchat.api_client: Retrieved 0 partner-bridge messages"
+        )
+        == KIND_NOISE
+    )
 
 
 def test_telegram_inbound_is_dialogue():

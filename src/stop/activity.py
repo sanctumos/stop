@@ -16,6 +16,7 @@ _NOISE_RES = [
         r"otto_bridge/(?:inbox|outbox)/",
         r"broca/run/otto_bridge",
         r"Retrieved 0 messages from web chat",
+        r"Retrieved 0 partner-bridge messages",
         r"httpx: HTTP Request:.*(?:localhost|127\.0\.0\.1):8284",
         r"plugins\.\w+_vernal_webchat\.api_client",
         r"runtime\.core\.queue:.*attached core block",

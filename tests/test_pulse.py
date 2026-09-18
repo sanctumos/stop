@@ -58,6 +58,25 @@ def test_polling_floor_stays_flat_while_burst_rises():
     assert rendered[-1] != GLYPHS[0]
 
 
+def test_partner_bridge_empty_poll_stays_flat():
+    pulse = AgentPulse()
+    now = 3_000.0
+    line = (
+        "[2026-09-18 14:35:02] INFO "
+        "plugins.rico_kitchen_webchat.api_client: Retrieved 0 partner-bridge messages\n"
+    )
+    pulse.observe([_agent("rico", line)], now)
+    text = line
+    for step in range(1, 6):
+        text += (
+            f"[2026-09-18 14:35:{2+step*3:02d}] INFO "
+            "plugins.rico_kitchen_webchat.api_client: "
+            "Retrieved 0 partner-bridge messages\n"
+        )
+        rendered = pulse.observe([_agent("rico", text)], now + step)["rico"]
+    assert set(rendered) == {GLYPHS[0]}
+
+
 def test_rolling_hardcopy_counts_only_the_new_line():
     old = "\n".join(f"[2026-09-18 12:00:{i:02d}] INFO telegram inbound {i}" for i in range(10))
     new = "\n".join(f"[2026-09-18 12:00:{i:02d}] INFO telegram inbound {i}" for i in range(1, 11))
