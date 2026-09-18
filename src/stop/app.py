@@ -177,9 +177,10 @@ class HostStrip(Static):
 
     @staticmethod
     def _bar(pct: float, width: int = 14) -> str:
+        """btop-style continuum bar (█ / ░) — avoid ■ which fonts draw as diamonds."""
         pct = max(0.0, min(100.0, pct))
         filled = int(round((pct / 100.0) * width))
-        return "■" * filled + "·" * (width - filled)
+        return "█" * filled + "░" * (width - filled)
 
     @staticmethod
     def _rate(bps: float) -> str:
@@ -564,26 +565,26 @@ class StopApp(App[None]):
     #row { height: 2fr; }
     #agents {
         width: 30; height: 100%;
-        border: round $accent; border-title-align: left;
+        border: solid $accent; border-title-align: left;
         padding: 0 1;
     }
     #windows {
         width: 1fr; height: 100%;
-        border: round $primary;
+        border: solid $primary;
         padding: 0 1;
     }
     #win-meta { height: auto; max-height: 8; }
     #win-log { height: 1fr; background: transparent; }
     #turn-panel {
         height: 1fr; max-height: 50%;
-        border: tall $success;
+        border: solid $success;
         padding: 0 1;
     }
     #turn-meta { height: 1; }
     #turn-log { height: 1fr; min-height: 5; background: transparent; }
     #active {
         width: 1fr; height: 100%;
-        border: round $warning;
+        border: solid $warning;
         padding: 0 1;
     }
     #active-meta { height: auto; max-height: 2; }
@@ -591,12 +592,14 @@ class StopApp(App[None]):
     #bottom { height: 1fr; min-height: 12; }
     #letta {
         width: 1fr; height: 100%;
-        border: round $secondary;
+        border: solid $secondary;
         padding: 0 1;
     }
     #letta-meta { height: auto; max-height: 2; }
     #letta-log { height: 1fr; background: transparent; }
-    #agents:focus, #windows:focus, #active:focus, #letta:focus { border: round $success; }
+    #agents:focus, #windows:focus, #active:focus, #letta:focus {
+        border: heavy $success;
+    }
     #filter { dock: bottom; display: none; height: 3; }
     #filter.visible { display: block; }
 
@@ -605,7 +608,7 @@ class StopApp(App[None]):
         width: 64;
         height: auto;
         max-height: 90%;
-        border: heavy $accent;
+        border: solid $accent;
         background: $surface;
         padding: 1 2;
     }
