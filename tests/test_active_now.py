@@ -11,6 +11,8 @@ from stop.activity import (
     KIND_NOISE,
     classify_line,
     classify_scrollback,
+    latest_meaningful_log_epoch,
+    next_activity_epoch,
     pick_active_now,
     rank_active_windows,
     scrollback_delta_is_noise_only,
@@ -42,6 +44,24 @@ def test_noise_delta_does_not_count_as_activity():
     assert scrollback_delta_is_noise_only(old, new) is True
     new2 = old + "telegram inbound from Mark\n"
     assert scrollback_delta_is_noise_only(old, new2) is False
+
+
+def test_meaningful_activity_epoch_persists_and_ignores_newer_http_noise():
+    old = (
+        "[2026-09-18 12:38:28] INFO telegram inbound from Mark\n"
+        "[2026-09-18 12:38:29] INFO HTTP Request: PATCH "
+        "http://localhost:8284/v1/agents/x HTTP/1.1 200 OK\n"
+    )
+    epoch = latest_meaningful_log_epoch(old)
+    assert epoch > 0
+    assert next_activity_epoch(0.0, "", old, now=epoch + 100) == epoch
+    assert next_activity_epoch(epoch, old, old, now=epoch + 200) == epoch
+
+    noise = old + (
+        "[2026-09-18 12:40:00] INFO HTTP Request: PATCH "
+        "http://localhost:8284/v1/agents/x HTTP/1.1 200 OK\n"
+    )
+    assert next_activity_epoch(epoch, old, noise, now=epoch + 300) == epoch
 
 
 def test_active_now_prefers_dialogue_over_newer_bridge_noise():

@@ -73,7 +73,7 @@ def test_disable_during_seek_does_not_linger(tmp_path: Path):
     w = TurnStreamWorker(agents_root=tmp_path)
     gen_holder: dict[str, int] = {}
 
-    def fake_seek(creds, since, gen):  # noqa: ANN001
+    def fake_seek(creds, since, gen, **_kwargs):  # noqa: ANN001
         gen_holder["g"] = gen
         # Simulate long seek — disable mid-flight.
         time.sleep(0.15)

@@ -8,7 +8,11 @@ import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 
-from .activity import pick_active_now, scrollback_delta_is_noise_only
+from .activity import (
+    next_activity_epoch,
+    pick_active_now,
+    scrollback_delta_is_noise_only,
+)
 from .discovery import build_agents
 from .metrics import METRICS, calling_from_ui_thread
 from .models import (
@@ -200,11 +204,14 @@ class LiveHost(HostBackend):
         self._prev_states: dict[str, WindowState] = {}
         self._events: list[CrashEvent] = []
         self._scroll_cache: dict[str, tuple[float, str]] = {}
+        self._activity_epoch: dict[str, float] = {}
         self._cpu_primed = False
         # Hardcopy is expensive — throttle and skip excluded screens.
         self.hardcopy_interval_s = 2.0
         self.hardcopy_batch_budget_s = 2.0
-        self.hardcopy_max_screens = 4
+        self.hardcopy_max_screens = 6
+        self.hardcopy_probe_slots = 3
+        self._hardcopy_probe_cursor = 0
         self._last_hardcopy_epoch = 0.0
         # Ordered focus: selected Broca → Active Now → Letta → secondary (#4062).
         self._focus_order: list[str] = []
@@ -251,6 +258,53 @@ class LiveHost(HostBackend):
             if len(out) >= max_screens:
                 return out
         return out
+
+    @staticmethod
+    def plan_hardcopy_with_probes(
+        focus_order: list[str],
+        *,
+        available: set[str],
+        max_screens: int,
+        probe_slots: int,
+        probe_cursor: int,
+    ) -> tuple[list[str], int]:
+        """Keep focused panes hot while round-robin sampling other Brocas."""
+        if max_screens <= 0:
+            return [], probe_cursor
+        reserved = min(max(0, probe_slots), max(0, max_screens - 1))
+        primary_limit = max_screens - reserved
+        out = LiveHost.prioritize_hardcopy(
+            focus_order,
+            available=available,
+            max_screens=primary_limit,
+        )
+        seen = set(out)
+        brocas = sorted(
+            n
+            for n in available
+            if n.startswith("broca-") and n not in NEVER_HARDCOPY
+        )
+        cursor = probe_cursor
+        probes_added = 0
+        attempts = 0
+        while brocas and attempts < len(brocas) and probes_added < reserved:
+            name = brocas[cursor % len(brocas)]
+            cursor += 1
+            attempts += 1
+            if name in seen:
+                continue
+            out.append(name)
+            seen.add(name)
+            probes_added += 1
+        # If fewer probes exist than reserved slots, retain additional focused
+        # secondary windows rather than wasting the hardcopy budget.
+        for name in focus_order:
+            if len(out) >= max_screens:
+                break
+            if name in available and name not in seen and name not in NEVER_HARDCOPY:
+                out.append(name)
+                seen.add(name)
+        return out, cursor
 
     def _read_crontab(self) -> str:
         try:
@@ -315,15 +369,19 @@ class LiveHost(HostBackend):
             for n in sorted(s for s in available if s.startswith("broca-")):
                 if n not in focus:
                     focus.append(n)
-        want_list = self.prioritize_hardcopy(
-            focus, available=available, max_screens=self.hardcopy_max_screens
+        want_list, next_probe_cursor = self.plan_hardcopy_with_probes(
+            focus,
+            available=available,
+            max_screens=self.hardcopy_max_screens,
+            probe_slots=self.hardcopy_probe_slots,
+            probe_cursor=self._hardcopy_probe_cursor,
         )
-        want = set(want_list)
 
         # Prune scroll + bridge caches for gone screens.
         alive_names = {s.name for s in screens}
         for stale in [k for k in self._scroll_cache if k not in alive_names]:
             self._scroll_cache.pop(stale, None)
+            self._activity_epoch.pop(stale, None)
         for stale in [k for k in self._bridge_count_cache if k not in alive_names]:
             self._bridge_count_cache.pop(stale, None)
 
@@ -343,15 +401,20 @@ class LiveHost(HostBackend):
                         if stripped:
                             prev_cached = self._scroll_cache.get(w.screen_name)
                             prev_text = (prev_cached[1] if prev_cached else "").strip()
-                            if stripped != prev_text:
-                                if w.screen_name != "letta" and not scrollback_delta_is_noise_only(
-                                    prev_text, stripped
-                                ):
-                                    w.last_activity_epoch = now
+                            if w.screen_name != "letta":
+                                activity = next_activity_epoch(
+                                    self._activity_epoch.get(w.screen_name, 0.0),
+                                    prev_text,
+                                    stripped,
+                                    now=now,
+                                )
+                                self._activity_epoch[w.screen_name] = activity
+                                w.last_activity_epoch = activity
                             w.last_scrollback = text
                             self._scroll_cache[w.screen_name] = (now, text)
                         hardcopied.add(screen_name)
             self._last_hardcopy_epoch = time.time()
+            self._hardcopy_probe_cursor = next_probe_cursor
 
         for agent in agents:
             for w in agent.windows:
@@ -361,6 +424,9 @@ class LiveHost(HostBackend):
                     if w.screen_name in self._scroll_cache:
                         _, cached = self._scroll_cache[w.screen_name]
                         w.last_scrollback = cached
+                        w.last_activity_epoch = self._activity_epoch.get(
+                            w.screen_name, 0.0
+                        )
                     elif w.log_path:
                         p = Path(w.log_path)
                         if p.is_file():

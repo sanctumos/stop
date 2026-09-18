@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime
 
 from .models import EXCLUDED_SCREEN_NAMES, Agent, Window, WindowState
 
@@ -50,6 +51,9 @@ _DIALOGUE_RES = [
 KIND_NOISE = 0
 KIND_OTHER = 1
 KIND_DIALOGUE = 2
+_LOG_TIMESTAMP_RE = re.compile(
+    r"^\[(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})\]"
+)
 
 
 def classify_line(line: str) -> int:
@@ -106,6 +110,39 @@ def scrollback_delta_is_noise_only(old: str, new: str) -> bool:
     if not delta:
         return True
     return all(classify_line(ln) == KIND_NOISE for ln in delta if ln.strip())
+
+
+def latest_meaningful_log_epoch(text: str) -> float:
+    """Timestamp of the newest non-noise log record in screen hardcopy."""
+    for line in reversed((text or "").splitlines()):
+        match = _LOG_TIMESTAMP_RE.match(line)
+        if not match or classify_line(line) == KIND_NOISE:
+            continue
+        try:
+            return datetime.strptime(
+                match.group(1), "%Y-%m-%d %H:%M:%S"
+            ).timestamp()
+        except ValueError:
+            continue
+    return 0.0
+
+
+def next_activity_epoch(
+    previous_epoch: float,
+    old_scrollback: str,
+    new_scrollback: str,
+    *,
+    now: float,
+) -> float:
+    """Advance and persist meaningful activity across immutable snapshots."""
+    if (old_scrollback or "").strip() == (new_scrollback or "").strip():
+        return previous_epoch
+    parsed = latest_meaningful_log_epoch(new_scrollback)
+    if parsed:
+        return max(previous_epoch, parsed)
+    if not scrollback_delta_is_noise_only(old_scrollback, new_scrollback):
+        return max(previous_epoch, now)
+    return previous_epoch
 
 
 def rank_active_windows(

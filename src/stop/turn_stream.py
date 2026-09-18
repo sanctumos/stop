@@ -583,14 +583,36 @@ def prune_seen_runs(order: list[str], *, maxlen: int = 100) -> tuple[list[str], 
     return kept, set(kept)
 
 
+def normalized_query(text: str) -> str:
+    """Canonical query text used to correlate Broca and Letta records."""
+    return " ".join(clean_user_query(text).split())
+
+
+def run_query_matches(rows: list[dict], expected_query: str) -> bool:
+    """True only when this run contains the current Broca user query."""
+    expected = normalized_query(expected_query)
+    actual = normalized_query(extract_user_query(rows))
+    return bool(expected and actual and expected == actual)
+
+
 def pick_run_id(
     creds: LettaAgentCreds,
     *,
     since_epoch: float,
     seen_run_ids: set[str],
-    allow_old_active: bool = False,
+    recovery_query: str = "",
+    now_epoch: float | None = None,
+    max_recovery_age_s: float = 900.0,
 ) -> str | None:
-    """Choose a fresh background run for this agent after turn start."""
+    """Choose a fresh run, correlating reload recovery to the Broca query.
+
+    Letta's ``/runs/active`` may include zombie rows many months old. A normal
+    log-edge seek keeps the tight creation-time window. Reload recovery permits
+    a longer-running turn, but only inside the stream wall and only when the
+    run's user message exactly matches Broca's current message.
+    """
+    now_epoch = now_epoch or time.time()
+    recovering = bool(normalized_query(recovery_query))
     # Active first (scoped when API allows).
     active: object = []
     try:
@@ -622,17 +644,22 @@ def pick_run_id(
     candidates.extend(list_runs_for_agent(creds, limit=25))
 
     best: tuple[float, str] | None = None
-    # Hardcopy lag + long turns: Broca trap can fire tens of seconds after
-    # created_at. Keep a wide floor so we still catch the run.
-    floor = since_epoch - 180.0
+    considered: set[str] = set()
+    live_floor = (
+        now_epoch - max_recovery_age_s if recovering else since_epoch - 180.0
+    )
+    completed_floor = (
+        now_epoch - max_recovery_age_s if recovering else since_epoch - 8.0
+    )
     for r in candidates:
         if not isinstance(r, dict):
             continue
         if r.get("agent_id") != creds.agent_id:
             continue
         rid = r.get("id") or ""
-        if not rid or rid in seen_run_ids:
+        if not rid or rid in seen_run_ids or rid in considered:
             continue
+        considered.add(rid)
         # Prefer background runs (required for /stream observer).
         if r.get("background") is False:
             continue
@@ -643,14 +670,18 @@ def pick_run_id(
         # turn — a prior finished run inside the wide floor must not steal the
         # pane (that showed the previous query while waiting).
         if status in ("running", "created"):
-            if not allow_old_active and created_epoch and created_epoch < floor:
+            if not created_epoch or created_epoch < live_floor:
                 continue
             rank = 2
         elif status in ("completed", "succeeded"):
-            if not created_epoch or created_epoch < since_epoch - 8.0:
+            if not created_epoch or created_epoch < completed_floor:
                 continue
             rank = 1
         else:
+            continue
+        if recovering and not run_query_matches(
+            fetch_run_messages(creds, rid), recovery_query
+        ):
             continue
         score = rank * 1e12 + (created_epoch or 0.0)
         if best is None or score > best[0]:
@@ -942,7 +973,7 @@ class TurnStreamWorker:
                 creds,
                 since=time.time(),
                 initial_query=str(data.get("message") or ""),
-                allow_old_active=True,
+                recovery_query=str(data.get("message") or ""),
             )
 
         self._probe_thread = threading.Thread(
@@ -956,7 +987,7 @@ class TurnStreamWorker:
         *,
         since: float,
         initial_query: str = "",
-        allow_old_active: bool = False,
+        recovery_query: str = "",
     ) -> None:
         self._stop_event.clear()
         broca_q = clean_user_query(initial_query)
@@ -1000,7 +1031,7 @@ class TurnStreamWorker:
                     creds,
                     since,
                     gen,
-                    allow_old_active=allow_old_active,
+                    recovery_query=recovery_query,
                 )
             except Exception as exc:  # noqa: BLE001
                 if not self._gen_ok(gen):
@@ -1054,7 +1085,7 @@ class TurnStreamWorker:
         since: float,
         gen: int,
         *,
-        allow_old_active: bool = False,
+        recovery_query: str = "",
     ) -> None:
         deadline = since + self.SEEK_TIMEOUT_S
         run_id = None
@@ -1065,7 +1096,7 @@ class TurnStreamWorker:
                 creds,
                 since_epoch=since,
                 seen_run_ids=self._seen_runs,
-                allow_old_active=allow_old_active,
+                recovery_query=recovery_query,
             )
             if run_id:
                 break

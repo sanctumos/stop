@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from stop.turn_stream import (
@@ -200,7 +200,108 @@ def test_bridge_probe_recovers_turn_already_in_progress(tmp_path: Path, monkeypa
         time.sleep(0.01)
     assert started
     assert started[0]["initial_query"] == "QUERY ALREADY RUNNING"
-    assert started[0]["allow_old_active"] is True
+    assert started[0]["recovery_query"] == "QUERY ALREADY RUNNING"
+
+
+def test_recovery_rejects_zombies_and_matches_current_query(tmp_path: Path, monkeypatch):
+    from stop.turn_stream import LettaAgentCreds, pick_run_id
+
+    now = time.time()
+    creds = LettaAgentCreds(
+        agent_name="athena",
+        agent_id="agent-x",
+        api_key="k",
+        endpoint="http://127.0.0.1:9",
+    )
+
+    def iso(epoch: float) -> str:
+        return datetime.fromtimestamp(epoch, timezone.utc).isoformat()
+
+    rows = [
+        {
+            "id": "zombie-toast",
+            "agent_id": "agent-x",
+            "status": "running",
+            "background": True,
+            "created_at": iso(now - 180 * 86400),
+        },
+        {
+            "id": "fresh-wrong-query",
+            "agent_id": "agent-x",
+            "status": "running",
+            "background": True,
+            "created_at": iso(now - 30),
+        },
+        {
+            "id": "fresh-current-query",
+            "agent_id": "agent-x",
+            "status": "running",
+            "background": True,
+            "created_at": iso(now - 90),
+        },
+    ]
+    monkeypatch.setattr("stop.turn_stream._http_json", lambda *a, **k: rows)
+    monkeypatch.setattr("stop.turn_stream.list_runs_for_agent", lambda *a, **k: [])
+
+    messages = {
+        "zombie-toast": [
+            {"message_type": "user_message", "content": "Build the Toast API tool"}
+        ],
+        "fresh-wrong-query": [
+            {"message_type": "user_message", "content": "Some other current turn"}
+        ],
+        "fresh-current-query": [
+            {
+                "message_type": "user_message",
+                "content": "Athena, discuss our actual topic",
+            }
+        ],
+    }
+    monkeypatch.setattr(
+        "stop.turn_stream.fetch_run_messages",
+        lambda _creds, rid: messages[rid],
+    )
+    assert (
+        pick_run_id(
+            creds,
+            since_epoch=now,
+            seen_run_ids=set(),
+            recovery_query="Athena, discuss our actual topic",
+            now_epoch=now,
+        )
+        == "fresh-current-query"
+    )
+
+
+def test_normal_seek_rejects_old_active_even_when_letta_calls_it_running(
+    monkeypatch,
+):
+    from stop.turn_stream import LettaAgentCreds, pick_run_id
+
+    now = time.time()
+    creds = LettaAgentCreds("athena", "agent-x", "k", "http://127.0.0.1:9")
+    rows = [
+        {
+            "id": "six-month-zombie",
+            "agent_id": "agent-x",
+            "status": "running",
+            "background": True,
+            "created_at": datetime.fromtimestamp(
+                now - 180 * 86400, timezone.utc
+            ).isoformat(),
+        }
+    ]
+    monkeypatch.setattr("stop.turn_stream._http_json", lambda *a, **k: rows)
+    monkeypatch.setattr("stop.turn_stream.list_runs_for_agent", lambda *a, **k: [])
+    assert (
+        pick_run_id(
+            creds,
+            since_epoch=now,
+            seen_run_ids=set(),
+            now_epoch=now,
+        )
+        is None
+    )
 
 
 def test_worker_second_tick_with_turn_seeks_without_creds(tmp_path: Path):

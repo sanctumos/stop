@@ -43,3 +43,43 @@ def test_set_focus_screens_dedupes_preserving_order():
     h.set_focus_screens(["broca-x"])
     assert h._focus_order[0] == "broca-x"
     assert h._focus_order[-1] == "letta"
+
+
+def test_plan_reserves_round_robin_slots_for_unfocused_brocas():
+    available = {
+        "broca-selected",
+        "broca-active",
+        "letta",
+        "broca-a",
+        "broca-b",
+        "broca-c",
+        "broca-d",
+    }
+    focus = ["broca-selected", "broca-active", "letta"]
+    first, cursor = LiveHost.plan_hardcopy_with_probes(
+        focus,
+        available=available,
+        max_screens=5,
+        probe_slots=2,
+        probe_cursor=0,
+    )
+    second, _ = LiveHost.plan_hardcopy_with_probes(
+        focus,
+        available=available,
+        max_screens=5,
+        probe_slots=2,
+        probe_cursor=cursor,
+    )
+    assert first[:3] == focus
+    assert second[:3] == focus
+    assert len(first) == len(second) == 5
+    assert set(first[3:]) != set(second[3:])
+    assert set(first + second) >= {
+        "broca-selected",
+        "broca-active",
+        "letta",
+        "broca-a",
+        "broca-b",
+        "broca-c",
+        "broca-d",
+    }
