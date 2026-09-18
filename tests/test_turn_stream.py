@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime
 from pathlib import Path
 
 from stop.turn_stream import (
@@ -10,14 +11,47 @@ from stop.turn_stream import (
     TurnStreamWorker,
     format_stream_event,
     load_agent_creds,
+    log_line_is_fresh,
     scrollback_signals_turn_start,
 )
 
 
+def _ts(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _live(epoch: float, msg: str = "Processing message in LIVE mode") -> str:
+    return f"[{_ts(epoch)}] INFO {msg}\n"
+
+
 def test_scrollback_detects_new_turn_line():
-    prev = "2026-09-17 INFO idle\n2026-09-17 INFO waiting\n"
-    new = prev + "2026-09-17 INFO Processing message in LIVE mode\n"
-    assert scrollback_signals_turn_start(prev, new) is True
+    now = time.time()
+    prev = f"{_ts(now - 5)} INFO idle\n{_ts(now - 4)} INFO waiting\n"
+    new = prev + _live(now)
+    assert scrollback_signals_turn_start(prev, new, now=now) is True
+
+
+def test_scrollback_rejects_stale_live_timestamp():
+    """Reload thrash resurfaces old LIVE rows — must not arm the popup."""
+    now = time.time()
+    prev = "idle\n"
+    stale = prev + _live(now - 600)  # 10 minutes ago
+    assert scrollback_signals_turn_start(prev, stale, now=now) is False
+
+
+def test_scrollback_rejects_untimestamped_live():
+    now = time.time()
+    prev = "idle\n"
+    new = prev + "Processing message in LIVE mode\n"
+    assert scrollback_signals_turn_start(prev, new, now=now) is False
+
+
+def test_log_line_is_fresh_window():
+    now = time.time()
+    assert log_line_is_fresh(_live(now).rstrip(), now=now) is True
+    assert log_line_is_fresh(_live(now - 59).rstrip(), now=now) is True
+    assert log_line_is_fresh(_live(now - 90).rstrip(), now=now) is False
+    assert log_line_is_fresh("Processing message in LIVE mode", now=now) is False
 
 
 def test_scrollback_ignores_identical():
@@ -33,12 +67,13 @@ def test_scrollback_ignores_noise_delta():
 
 def test_scrollback_ignores_lagging_http_post_ok():
     """POST …/messages 200 is logged when the Letta call finishes — not a new turn."""
-    prev = "Processing message in LIVE mode\n"
+    now = time.time()
+    prev = _live(now - 10)
     new = (
         prev
-        + 'HTTP Request: POST http://localhost:8284/v1/agents/agent-x/messages "HTTP/1.1 200 OK"\n'
+        + f'[{_ts(now)}] INFO HTTP Request: POST http://localhost:8284/v1/agents/agent-x/messages "HTTP/1.1 200 OK"\n'
     )
-    assert scrollback_signals_turn_start(prev, new) is False
+    assert scrollback_signals_turn_start(prev, new, now=now) is False
 
 
 def test_scrollback_ignores_dequeue_alone():
@@ -49,27 +84,30 @@ def test_scrollback_ignores_dequeue_alone():
 
 def test_scrollback_ignores_old_live_mode_on_unstable_hardcopy():
     """Hardcopy rewrite with old LIVE lines still in the tail must not re-trap."""
+    now = time.time()
+    old = now - 3600
     live = (
-        "[2026-09-17 20:19:47] INFO Processing message in LIVE mode\n"
-        "[2026-09-17 20:19:47] INFO Processing message with attached core block\n"
-        "[2026-09-17 20:20:05] INFO Routing response through otto_bridge handler\n"
+        f"[{_ts(old)}] INFO Processing message in LIVE mode\n"
+        f"[{_ts(old)}] INFO Processing message with attached core block\n"
+        f"[{_ts(old + 20)}] INFO Routing response through otto_bridge handler\n"
     )
     prev = "earlier\n" + live
     # Unstable: dropped 'earlier', same LIVE lines still present, plus noise.
-    new = live + "[2026-09-17 20:21:00] INFO some keepalive\n"
-    assert scrollback_signals_turn_start(prev, new) is False
+    new = live + f"[{_ts(old + 60)}] INFO some keepalive\n"
+    assert scrollback_signals_turn_start(prev, new, now=now) is False
 
 
 def test_scrollback_detects_new_live_mode_amid_unstable_hardcopy():
+    now = time.time()
     prev = (
-        "[2026-09-17 20:19:47] INFO Processing message in LIVE mode\n"
-        "[2026-09-17 20:20:05] INFO Routing response through otto_bridge handler\n"
+        f"[{_ts(now - 120)}] INFO Processing message in LIVE mode\n"
+        f"[{_ts(now - 100)}] INFO Routing response through otto_bridge handler\n"
     )
     new = (
-        "[2026-09-17 20:20:05] INFO Routing response through otto_bridge handler\n"
-        "[2026-09-17 20:25:00] INFO Processing message in LIVE mode\n"
+        f"[{_ts(now - 100)}] INFO Routing response through otto_bridge handler\n"
+        + _live(now)
     )
-    assert scrollback_signals_turn_start(prev, new) is True
+    assert scrollback_signals_turn_start(prev, new, now=now) is True
 
 
 def test_format_assistant_and_think():
@@ -111,8 +149,9 @@ def test_worker_default_enabled_and_toggle(tmp_path: Path):
 
 def test_worker_first_paint_does_not_fire(tmp_path: Path):
     w = TurnStreamWorker(agents_root=tmp_path)
-    text = "Processing message in LIVE mode\n"
-    w.tick(selected_agent="athena", broca_scrollback=text)
+    now = time.time()
+    text = _live(now)
+    w.tick(selected_agent="athena", broca_scrollback=text, now=now)
     snap = w.snapshot()
     assert snap.active is False
     assert snap.status == "idle"
@@ -120,11 +159,13 @@ def test_worker_first_paint_does_not_fire(tmp_path: Path):
 
 def test_worker_second_tick_with_turn_seeks_without_creds(tmp_path: Path):
     w = TurnStreamWorker(agents_root=tmp_path)
+    now = time.time()
     prev = "idle\n"
-    w.tick(selected_agent="athena", broca_scrollback=prev)
+    w.tick(selected_agent="athena", broca_scrollback=prev, now=now)
     w.tick(
         selected_agent="athena",
-        broca_scrollback=prev + "Processing message in LIVE mode\n",
+        broca_scrollback=prev + _live(now),
+        now=now,
     )
     snap = w.snapshot()
     assert snap.active is True
@@ -134,11 +175,13 @@ def test_worker_second_tick_with_turn_seeks_without_creds(tmp_path: Path):
 
 def test_toggle_off_clears_active(tmp_path: Path):
     w = TurnStreamWorker(agents_root=tmp_path)
+    now = time.time()
     prev = "idle\n"
-    w.tick(selected_agent="athena", broca_scrollback=prev)
+    w.tick(selected_agent="athena", broca_scrollback=prev, now=now)
     w.tick(
         selected_agent="athena",
-        broca_scrollback=prev + "Processing message in LIVE mode\n",
+        broca_scrollback=prev + _live(now),
+        now=now,
     )
     assert w.snapshot().active is True
     w.set_enabled(False)
@@ -162,13 +205,13 @@ def test_linger_ignores_new_turn_signals(tmp_path: Path):
             text="HELLO FROM TURN\n— turn complete —",
             linger_until=now + 60.0,
         )
-    w._prev_scroll["athena"] = "Processing message in LIVE mode\n"
+    w._prev_scroll["athena"] = _live(now - 30)
     w.tick(
         selected_agent="athena",
         broca_scrollback=(
-            "Processing message in LIVE mode\n"
-            'HTTP Request: POST http://localhost:8284/v1/agents/a/messages "HTTP/1.1 200 OK"\n'
-            "Processing message in LIVE mode\n"  # even a real-looking line
+            _live(now - 30)
+            + f'[{_ts(now)}] INFO HTTP Request: POST http://localhost:8284/v1/agents/a/messages "HTTP/1.1 200 OK"\n'
+            + _live(now)  # even a real-looking fresh line
         ),
         now=now,
     )
@@ -181,12 +224,14 @@ def test_linger_ignores_new_turn_signals(tmp_path: Path):
 def test_empty_hardcopy_does_not_reset_cursor(tmp_path: Path):
     """Empty hardcopy must not arm first-paint skip on the next full capture."""
     w = TurnStreamWorker(agents_root=tmp_path)
+    now = time.time()
     prev = "idle\n"
-    w.tick(selected_agent="athena", broca_scrollback=prev)
-    w.tick(selected_agent="athena", broca_scrollback="")  # race
+    w.tick(selected_agent="athena", broca_scrollback=prev, now=now)
+    w.tick(selected_agent="athena", broca_scrollback="", now=now)  # race
     w.tick(
         selected_agent="athena",
-        broca_scrollback=prev + "Processing message in LIVE mode\n",
+        broca_scrollback=prev + _live(now),
+        now=now,
     )
     snap = w.snapshot()
     assert snap.active is True
@@ -307,17 +352,20 @@ def test_fetch_broca_triggering_message_via_http(tmp_path: Path):
 
 def test_background_agent_turn_does_not_replace_focused(tmp_path: Path):
     w = TurnStreamWorker(agents_root=tmp_path)
+    now = time.time()
     w.tick(
         selected_agent="ada",
         broca_by_agent={"ada": "idle\n", "rico": "idle\n"},
+        now=now,
     )
     # Focused ada is seeking/erroring (no creds).
     w.tick(
         selected_agent="ada",
         broca_by_agent={
-            "ada": "idle\nProcessing message in LIVE mode\n",
+            "ada": "idle\n" + _live(now),
             "rico": "idle\n",
         },
+        now=now,
     )
     assert w.snapshot().status in ("seeking", "error")
     assert w.snapshot().agent_name == "ada"
@@ -329,9 +377,10 @@ def test_background_agent_turn_does_not_replace_focused(tmp_path: Path):
     w.tick(
         selected_agent="ada",
         broca_by_agent={
-            "ada": "idle\nProcessing message in LIVE mode\nmore\n",
-            "rico": "idle\nProcessing message in LIVE mode\n",
+            "ada": "idle\n" + _live(now) + "more\n",
+            "rico": "idle\n" + _live(now),
         },
+        now=now,
     )
     snap = w.snapshot()
     assert snap.agent_name == "ada"

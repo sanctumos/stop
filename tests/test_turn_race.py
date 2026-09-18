@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -14,6 +15,12 @@ from stop.turn_stream import (
     ordered_unique_message_text,
     prune_seen_runs,
 )
+
+
+def _live(epoch: float | None = None) -> str:
+    epoch = epoch if epoch is not None else time.time()
+    ts = datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M:%S")
+    return f"[{ts}] INFO Processing message in LIVE mode\n"
 
 
 def test_merge_turn_bodies_monotonic():
@@ -68,10 +75,12 @@ def test_disable_during_seek_does_not_linger(tmp_path: Path):
             "AGENT_ID=agent-x\nAGENT_API_KEY=k\nAGENT_ENDPOINT=http://127.0.0.1:9\n",
             encoding="utf-8",
         )
-        w.tick(selected_agent="athena", broca_scrollback="idle\n")
+        now = time.time()
+        w.tick(selected_agent="athena", broca_scrollback="idle\n", now=now)
         w.tick(
             selected_agent="athena",
-            broca_scrollback="idle\nProcessing message in LIVE mode\n",
+            broca_scrollback="idle\n" + _live(now),
+            now=now,
         )
         assert w.snapshot().status == "seeking"
         time.sleep(0.05)
@@ -140,12 +149,15 @@ def test_disable_joins_worker_thread(tmp_path: Path):
             "AGENT_ID=agent-x\nAGENT_API_KEY=k\nAGENT_ENDPOINT=http://127.0.0.1:9\n",
             encoding="utf-8",
         )
-        w.tick(selected_agent="athena", broca_scrollback="idle\n")
+        now = time.time()
+        w.tick(selected_agent="athena", broca_scrollback="idle\n", now=now)
         w.tick(
             selected_agent="athena",
-            broca_scrollback="idle\nProcessing message in LIVE mode\n",
+            broca_scrollback="idle\n" + _live(now),
+            now=now,
         )
-        assert started.wait(1.0)
+        assert w.snapshot().status == "seeking"
+        assert started.wait(3.0), "seek thread never entered _seek_and_stream"
         w.set_enabled(False)
         # Thread should be joinable / stopped for new work.
         release.set()

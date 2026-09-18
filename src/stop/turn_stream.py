@@ -24,6 +24,19 @@ _TURN_START_RES = [
     )
 ]
 
+# Leading timestamp on Broca / logging lines. Hardcopy reloads can resurface
+# old LIVE-mode rows — those must not arm the turn popup.
+_LOG_TS_RES = [
+    re.compile(
+        r"^\[?"
+        r"(?P<ts>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?)"
+        r"\]?"
+    ),
+]
+
+# Turn-start log line must be within this many seconds of wall clock.
+TURN_START_MAX_AGE_S = 60.0
+
 _TURN_END_BROCA_RES = [
     re.compile(p, re.I)
     for p in (
@@ -31,6 +44,90 @@ _TURN_END_BROCA_RES = [
         r"Detaching core block",
     )
 ]
+
+
+def parse_log_line_epoch(line: str) -> float | None:
+    """Parse a leading log timestamp to epoch seconds, or None if absent/bad."""
+    s = (line or "").strip()
+    if not s:
+        return None
+    for rx in _LOG_TS_RES:
+        m = rx.match(s)
+        if not m:
+            continue
+        raw = m.group("ts").replace("T", " ")
+        # Truncate fractional seconds for fromisoformat on 3.12+
+        if "." in raw:
+            main, frac = raw.split(".", 1)
+            raw = f"{main}.{frac[:6]}"
+        try:
+            from datetime import datetime
+
+            return datetime.fromisoformat(raw).timestamp()
+        except ValueError:
+            continue
+    return None
+
+
+def log_line_is_fresh(
+    line: str,
+    *,
+    now: float | None = None,
+    max_age_s: float = TURN_START_MAX_AGE_S,
+) -> bool:
+    """True when the line's timestamp is within ``max_age_s`` of ``now``.
+
+    Untimestamped lines are rejected — reload thrash often re-surfaces
+    stamp-less or ancient LIVE rows that are not real turns.
+    """
+    now = now if now is not None else time.time()
+    epoch = parse_log_line_epoch(line)
+    if epoch is None:
+        return False
+    return abs(now - epoch) <= max_age_s
+
+
+def scrollback_signals_turn_start(
+    prev: str,
+    new: str,
+    *,
+    now: float | None = None,
+    max_age_s: float = TURN_START_MAX_AGE_S,
+) -> bool:
+    """True when new Broca scrollback added a *fresh* turn-start line.
+
+    Unstable hardcopy often rewrites the tail without a pure append. Falling
+    back to ``new_lines[-12:]`` re-armed the popup at rest whenever those
+    lines still contained an old ``LIVE mode`` row. Only lines that are not
+    already in ``prev`` count — and the matching line's timestamp must be
+    within about a minute of wall clock (reload/re-poll artifacts fail this).
+    """
+    if not (new or "").strip():
+        return False
+    now = now if now is not None else time.time()
+    # hardcopy can embed NULs / C1 controls — normalize before compare.
+    prev = (prev or "").replace("\x00", "")
+    new = (new or "").replace("\x00", "")
+    old_lines = prev.splitlines()
+    new_lines = new.splitlines()
+    if new_lines == old_lines:
+        return False
+    if len(new_lines) >= len(old_lines) and new_lines[: len(old_lines)] == old_lines:
+        delta = new_lines[len(old_lines) :]
+    else:
+        old_set = set(old_lines)
+        delta = [ln for ln in new_lines if ln not in old_set]
+        if not delta:
+            return False
+        delta = delta[-20:]
+    for ln in delta:
+        if not ln.strip():
+            continue
+        if not any(r.search(ln) for r in _TURN_START_RES):
+            continue
+        if log_line_is_fresh(ln, now=now, max_age_s=max_age_s):
+            return True
+    return False
 
 
 @dataclass
@@ -59,6 +156,7 @@ class TurnStreamState:
     linger_until: float = 0.0
     # Background agents that signaled a turn while another turn is focused (#4069).
     pending_agents: list[str] = field(default_factory=list)
+
 
 def load_agent_creds(agents_root: Path, agent_name: str) -> LettaAgentCreds | None:
     """Read AGENT_ID / AGENT_API_KEY / AGENT_ENDPOINT from agents/<name>/broca/.env."""
@@ -91,36 +189,6 @@ def load_agent_creds(agents_root: Path, agent_name: str) -> LettaAgentCreds | No
         agent_id=agent_id,
         api_key=api_key,
         endpoint=endpoint,
-    )
-
-
-def scrollback_signals_turn_start(prev: str, new: str) -> bool:
-    """True when new Broca scrollback added a turn-start line.
-
-    Unstable hardcopy often rewrites the tail without a pure append. Falling
-    back to ``new_lines[-12:]`` re-armed the popup at rest whenever those
-    lines still contained an old ``LIVE mode`` row. Only lines that are not
-    already in ``prev`` count.
-    """
-    if not (new or "").strip():
-        return False
-    # hardcopy can embed NULs / C1 controls — normalize before compare.
-    prev = (prev or "").replace("\x00", "")
-    new = (new or "").replace("\x00", "")
-    old_lines = prev.splitlines()
-    new_lines = new.splitlines()
-    if new_lines == old_lines:
-        return False
-    if len(new_lines) >= len(old_lines) and new_lines[: len(old_lines)] == old_lines:
-        delta = new_lines[len(old_lines) :]
-    else:
-        old_set = set(old_lines)
-        delta = [ln for ln in new_lines if ln not in old_set]
-        if not delta:
-            return False
-        delta = delta[-20:]
-    return any(
-        any(r.search(ln) for r in _TURN_START_RES) for ln in delta if ln.strip()
     )
 
 
@@ -716,7 +784,7 @@ class TurnStreamWorker:
                 self._prev_scroll[name] = new
                 continue
             self._prev_scroll[name] = new
-            if scrollback_signals_turn_start(prev, new):
+            if scrollback_signals_turn_start(prev, new, now=now):
                 started.append(name)
 
         if busy:
@@ -770,7 +838,7 @@ class TurnStreamWorker:
 
     def _start_seek(self, creds: LettaAgentCreds, *, since: float) -> None:
         self._stop_event.clear()
-        # Console trap has no ask text — pull it from Broca sanctum.db immediately
+        # Console trap has no ask text — pull it from Otto bridge HTTP immediately
         # so the waiting pane shows `> query` before the Letta run exists.
         broca_q = fetch_broca_triggering_message(self.agents_root, creds.agent_name)
         with self._lock:
