@@ -230,3 +230,49 @@ def test_clean_and_extract_user_query():
     assert "waiting for first model step" in wait
     body = with_query_header("[think] hmm\nOK", q)
     assert body.startswith("> ping please\n\n[think]")
+
+
+def test_fetch_broca_triggering_message_from_queue(tmp_path: Path):
+    """LIVE-mode trap reads the ask from Broca sanctum.db, not console logs."""
+    import sqlite3
+
+    from stop.turn_stream import fetch_broca_triggering_message
+
+    broca = tmp_path / "athena" / "broca"
+    broca.mkdir(parents=True)
+    db = broca / "sanctum.db"
+    con = sqlite3.connect(db)
+    con.executescript(
+        """
+        CREATE TABLE messages (
+          id INTEGER PRIMARY KEY,
+          letta_user_id INTEGER,
+          platform_profile_id INTEGER,
+          role TEXT,
+          message TEXT,
+          timestamp TEXT,
+          processed INTEGER,
+          agent_response TEXT
+        );
+        CREATE TABLE queue (
+          id INTEGER PRIMARY KEY,
+          letta_user_id INTEGER,
+          message_id INTEGER,
+          status TEXT,
+          attempts INTEGER,
+          timestamp TEXT
+        );
+        INSERT INTO messages (id, role, message, processed)
+          VALUES (10, 'user', 'old ask', 1);
+        INSERT INTO messages (id, role, message, processed)
+          VALUES (11, 'user', 'TRIGGER_FROM_BROCA_DB please', 0);
+        INSERT INTO queue (id, message_id, status)
+          VALUES (100, 10, 'completed');
+        INSERT INTO queue (id, message_id, status)
+          VALUES (101, 11, 'processing');
+        """
+    )
+    con.commit()
+    con.close()
+    q = fetch_broca_triggering_message(tmp_path, "athena")
+    assert q == "TRIGGER_FROM_BROCA_DB please"

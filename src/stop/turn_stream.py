@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 import threading
 import time
 import urllib.error
@@ -167,6 +168,76 @@ def clean_user_query(content: str) -> str:
             break
         text = text[m.end() :].lstrip()
     return text.strip()
+
+
+def broca_db_path(agents_root: Path, agent_name: str) -> Path | None:
+    """Path to agents/<name>/broca/sanctum.db when present."""
+    p = agents_root / agent_name / "broca" / "sanctum.db"
+    return p if p.is_file() else None
+
+
+def fetch_broca_triggering_message(
+    agents_root: Path, agent_name: str
+) -> str:
+    """Read the user message that triggered the current Broca turn.
+
+    Console hardcopy only shows LIVE-mode lines — not the ask text. The ask
+    lives in Broca's ``messages`` table (joined via ``queue`` while processing).
+    Read-only. Prefer in-flight queue rows, else the latest user message.
+    """
+    db = broca_db_path(agents_root, agent_name)
+    if db is None:
+        return ""
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2.0)
+    except sqlite3.Error:
+        return ""
+    try:
+        # In-flight turn: queue row → messages.message
+        row = con.execute(
+            """
+            SELECT m.message
+            FROM queue q
+            JOIN messages m ON m.id = q.message_id
+            WHERE q.status IN ('processing', 'pending', 'queued')
+              AND m.role = 'user'
+              AND IFNULL(m.message, '') != ''
+            ORDER BY q.id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        if row and (row[0] or "").strip():
+            return clean_user_query(str(row[0]))
+        # Just-completed race: Broca may mark completed before our trap paints.
+        # Take the newest user message from the last few seconds of queue work.
+        row = con.execute(
+            """
+            SELECT m.message
+            FROM queue q
+            JOIN messages m ON m.id = q.message_id
+            WHERE m.role = 'user'
+              AND IFNULL(m.message, '') != ''
+            ORDER BY q.id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        if row and (row[0] or "").strip():
+            return clean_user_query(str(row[0]))
+        row = con.execute(
+            """
+            SELECT message FROM messages
+            WHERE role = 'user' AND IFNULL(message, '') != ''
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        if row and (row[0] or "").strip():
+            return clean_user_query(str(row[0]))
+    except sqlite3.Error:
+        return ""
+    finally:
+        con.close()
+    return ""
 
 
 def extract_user_query(rows: list[dict]) -> str:
@@ -547,15 +618,20 @@ class TurnStreamWorker:
 
     def _start_seek(self, creds: LettaAgentCreds, *, since: float) -> None:
         self._stop_event.clear()
+        # Console trap has no ask text — pull it from Broca sanctum.db immediately
+        # so the waiting pane shows `> query` before the Letta run exists.
+        broca_q = fetch_broca_triggering_message(self.agents_root, creds.agent_name)
         with self._lock:
             self.state.active = True
             self.state.lingering = False
             self.state.agent_name = creds.agent_name
             self.state.run_id = ""
-            self.state.query = ""
-            self.state.saw_waiting_query = False
+            self.state.query = broca_q
+            self.state.saw_waiting_query = bool(broca_q)
             self.state.status = "seeking"
-            self.state.text = waiting_panel_text(agent_name=creds.agent_name)
+            self.state.text = waiting_panel_text(
+                agent_name=creds.agent_name, query=broca_q
+            )
             self.state.error = ""
             self.state.started_at = since
             self.state.linger_until = 0.0
