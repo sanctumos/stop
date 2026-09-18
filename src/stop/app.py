@@ -19,6 +19,7 @@ from .host import FixtureHost, HostBackend, LiveHost
 from .livelog import LiveLogFeed
 from .models import Agent, HostSnapshot, Window, WindowState
 from .state import badge_label, is_failure, short_badge
+from .turn_stream import TurnStreamState, TurnStreamWorker
 
 
 def _state_style(state: WindowState) -> str:
@@ -121,6 +122,7 @@ class HelpScreen(ModalScreen[None]):
             "Tab          cycle panes (narrow: page agents→windows→Active Now)\n"
             "a            jump to Active Now\n"
             "l            jump to Letta pane\n"
+            "t            toggle turn-stream overlay (default ON)\n"
             "f            follow-lock / release Active Now\n"
             "/            filter agents\n"
             "?            this help\n"
@@ -128,6 +130,8 @@ class HelpScreen(ModalScreen[None]):
             "No restart button — cron restarts agents.\n"
             "Active Now follows human/agent dialogue — not otto_bridge chatter.\n"
             "Bottom row: Active Now (left) + Letta console (right).\n"
+            "Turn stream: Broca turn-start → Letta /v1/runs/{id}/stream;\n"
+            "  splits under the selected agent log, lingers 60s, hotkey t.\n"
             "stop screen is never hardcopied into this TUI.\n"
             "Log lines with [brackets] are escaped (cannot crash UI).\n\n"
             "[dim]Esc / q / ? to close[/dim]",
@@ -274,7 +278,7 @@ class AgentList(Static):
 
 
 class WindowPane(Vertical):
-    """Selected agent: compact window list + append-only live log."""
+    """Selected agent: compact window list + append-only live log + turn stream."""
 
     can_focus = True
     expanded = False
@@ -282,8 +286,10 @@ class WindowPane(Vertical):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._feed = LiveLogFeed(limit=400, width=200)
+        self._turn_feed = LiveLogFeed(limit=300, width=200)
         self._agent: Agent | None = None
         self._win_index = 0
+        self._turn_visible = False
 
     def compose(self) -> ComposeResult:
         yield Static(id="win-meta")
@@ -296,6 +302,20 @@ class WindowPane(Vertical):
             markup=False,
             auto_scroll=False,
         )
+        with Vertical(id="turn-panel"):
+            yield Static(id="turn-meta")
+            yield RichLog(
+                id="turn-log",
+                max_lines=300,
+                min_width=20,
+                wrap=True,
+                highlight=False,
+                markup=False,
+                auto_scroll=True,
+            )
+
+    def on_mount(self) -> None:
+        self.query_one("#turn-panel").display = False
 
     @staticmethod
     def _bridge_bit(w: Window | None) -> str:
@@ -359,6 +379,35 @@ class WindowPane(Vertical):
         # Live log = selected window only; append new lines, never rewrite on idle.
         source_key = f"{agent.name}:{w.id}:{self.expanded}"
         self._feed.sync(log, w.last_scrollback, source_key=source_key)
+
+    def show_turn(self, state: TurnStreamState) -> None:
+        """Show/hide the turn-stream split under the selected log."""
+        panel = self.query_one("#turn-panel")
+        meta = self.query_one("#turn-meta", Static)
+        log = self.query_one("#turn-log", RichLog)
+        want = bool(state.enabled and state.active and (state.text or state.error))
+        if want != self._turn_visible:
+            panel.display = want
+            self._turn_visible = want
+            if not want:
+                self._turn_feed.reset()
+                log.clear()
+        if not want:
+            return
+        if state.status == "linger":
+            title = f"turn · {state.agent_name} · linger"
+        elif state.status == "seeking":
+            title = f"turn · {state.agent_name} · seeking run…"
+        elif state.status == "error":
+            title = f"turn · {state.agent_name} · error"
+        else:
+            rid = (state.run_id or "")[-12:]
+            title = f"turn · {state.agent_name} · streaming {rid}"
+        _set_title(panel, title)
+        err = f"\n[error] {state.error}" if state.error else ""
+        body = (state.text or "") + err
+        _paint(meta, f"[b]{state.status}[/b]  [dim]t toggle off[/dim]")
+        self._turn_feed.sync(log, body, source_key=f"turn:{state.run_id}:{state.status}")
 
 
 class ActiveNowPane(Vertical):
@@ -478,6 +527,14 @@ class StopApp(App[None]):
     }
     #win-meta { height: auto; max-height: 8; }
     #win-log { height: 1fr; background: transparent; }
+    #turn-panel {
+        height: 1fr; max-height: 50%;
+        border: tall $success;
+        padding: 0 1;
+        display: none;
+    }
+    #turn-meta { height: 1; }
+    #turn-log { height: 1fr; background: transparent; }
     #active {
         width: 1fr; height: 100%;
         border: round $warning;
@@ -534,6 +591,7 @@ class StopApp(App[None]):
         Binding("tab", "cycle", "cycle", show=False),
         Binding("a", "focus_active", "active"),
         Binding("l", "focus_letta", "letta"),
+        Binding("t", "toggle_turn_stream", "turns"),
         Binding("f", "toggle_follow", "follow"),
         Binding("question_mark", "help", "help"),
         Binding("slash", "filter", "filter"),
@@ -549,8 +607,10 @@ class StopApp(App[None]):
         self._win_index = 0
         self._narrow_page = "agents"
         self._errors = 0
+        self._turn: TurnStreamWorker | None = None
         if isinstance(self.host, LiveHost):
             self.host.hardcopy_interval_s = float(self.config.refresh_hardcopy_s)
+            self._turn = TurnStreamWorker(agents_root=self.host.agents_root)
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -649,6 +709,7 @@ class StopApp(App[None]):
                 active, locked=self.follow_lock_id is not None
             )
             self.query_one(LettaPane).show(self._letta_window(snap))
+            self._tick_turn_stream(selected)
             self.query_one(EventStrip).show(snap)
             self._errors = 0
         except Exception as exc:  # noqa: BLE001 — keep TUI alive
@@ -663,6 +724,29 @@ class StopApp(App[None]):
                     f.write(time.strftime("%Y-%m-%dT%H:%M:%S ") + traceback.format_exc() + "\n")
             except OSError:
                 pass
+
+    def _tick_turn_stream(self, selected: Agent | None) -> None:
+        if self._turn is None:
+            return
+        broca_text = ""
+        name = selected.name if selected else None
+        if selected:
+            for w in selected.windows:
+                if (w.screen_name or "").startswith("broca-"):
+                    broca_text = w.last_scrollback or ""
+                    break
+        self._turn.tick(selected_agent=name, broca_scrollback=broca_text)
+        self.query_one(WindowPane).show_turn(self._turn.snapshot())
+
+    def action_toggle_turn_stream(self) -> None:
+        if self._turn is None:
+            return
+        on = self._turn.toggle()
+        # Immediate UI feedback in the event strip.
+        self.query_one(EventStrip).update(
+            f"events: turn-stream {'ON' if on else 'OFF'} (t to toggle)"
+        )
+        self.query_one(WindowPane).show_turn(self._turn.snapshot())
 
     def action_down(self) -> None:
         pane = self.query_one(WindowPane)
