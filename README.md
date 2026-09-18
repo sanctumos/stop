@@ -37,8 +37,12 @@ python3 -m venv .venv && .venv/bin/pip install -e .[dev]
 
 ## Guarantees
 
-- Never writes into `~/sanctum/**`, never touches any agent DB, never sends screen
-  commands other than `hardcopy`. Scratch lives in `/tmp/stop-<uid>/`.
+- Never writes into `~/sanctum/**`, never sends screen commands other than
+  `hardcopy`. Scratch lives in `/tmp/stop-<uid>/`.
+- Architecture: three lanes (collection / state / render) — see
+  [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). Widgets must not do host I/O.
+- Turn ask text currently may read Broca `sanctum.db` read-only (temporary);
+  rebuild #4069 moves that to published HTTP APIs only.
 - No restart buttons. Crashed windows go red and `stop` waits for the cron
   supervisor to bring them back.
 - Never destroy the shared `stop` screen (see above).
@@ -46,4 +50,5 @@ python3 -m venv .venv && .venv/bin/pip install -e .[dev]
 ## Keys
 
 `↑↓`/`jk` select agent · `Enter`/`Esc` expand pane · `Tab` cycle panes · `a` Active Now ·
-`f` follow-lock · `/` filter · `?` help · `q` quit. `Ctrl+S` is never bound.
+`l` Letta · `t` turn stream · `f` follow-lock · `/` filter · `?` help · `q` quit.
+`Ctrl+S` is never bound.

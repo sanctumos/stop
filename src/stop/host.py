@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .activity import pick_active_now, scrollback_delta_is_noise_only
 from .discovery import build_agents
+from .metrics import METRICS, calling_from_ui_thread
 from .models import (
     EXCLUDED_SCREEN_NAMES,
     NEVER_HARDCOPY,
@@ -208,6 +209,8 @@ class LiveHost(HostBackend):
         self._returned_at: dict[str, float] = {}
         # (epoch, bytes_sent, bytes_recv) for net rate
         self._prev_net: tuple[float, int, int] | None = None
+        # Textual main-thread id when known — snapshot must not run there (#4061).
+        self.ui_thread_ident: int | None = None
 
     def set_focus_screens(self, names: set[str]) -> None:
         """Prefer hardcopying these screens (selected agent + Active Now + letta)."""
@@ -243,6 +246,10 @@ class LiveHost(HostBackend):
 
     def snapshot(self) -> HostSnapshot:
         import psutil
+
+        t0 = time.perf_counter()
+        if calling_from_ui_thread(self.ui_thread_ident):
+            METRICS.note_host_io_on_ui_thread()
 
         now = time.time()
         do_hardcopy = (now - self._last_hardcopy_epoch) >= self.hardcopy_interval_s
@@ -405,7 +412,7 @@ class LiveHost(HostBackend):
         # Never block the UI thread with interval>0.
         cpu = psutil.cpu_percent(interval=None)
         load = os.getloadavg() if hasattr(os, "getloadavg") else (0.0, 0.0, 0.0)
-        return HostSnapshot(
+        snap = HostSnapshot(
             agents=agents,
             screens=screens,
             events=list(self._events[-50:]),
@@ -419,6 +426,8 @@ class LiveHost(HostBackend):
             net_up_bps=up_bps,
             net_down_bps=down_bps,
         )
+        METRICS.record_snapshot(time.perf_counter() - t0)
+        return snap
 
     def read_scrollback(self, screen_name: str) -> str:
         """Hardcopy into our tmp dir only — never attach, never quit.
@@ -434,6 +443,7 @@ class LiveHost(HostBackend):
         cached = self._scroll_cache.get(screen_name)
         cached_text = cached[1] if cached else ""
         out = self.tmp / f"{screen_name}.{time.time_ns()}.hc"
+        t0 = time.perf_counter()
         try:
             subprocess.run(
                 ["screen", "-S", screen_name, "-X", "hardcopy", "-h", str(out)],
@@ -471,6 +481,7 @@ class LiveHost(HostBackend):
         except (OSError, subprocess.TimeoutExpired):
             return cached_text
         finally:
+            METRICS.record_hardcopy(screen_name, time.perf_counter() - t0)
             try:
                 out.unlink(missing_ok=True)
             except OSError:

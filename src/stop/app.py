@@ -17,6 +17,7 @@ from .activity import pick_active_now
 from .config import StopConfig, apply_agent_order, load_config
 from .host import FixtureHost, HostBackend, LiveHost
 from .livelog import LiveLogFeed
+from .metrics import METRICS
 from .models import Agent, HostSnapshot, Window, WindowState
 from .state import badge_label, is_failure, short_badge
 from .turn_stream import TurnStreamState, TurnStreamWorker
@@ -681,6 +682,10 @@ class StopApp(App[None]):
         yield Footer()
 
     def on_mount(self) -> None:
+        import threading
+
+        if isinstance(self.host, LiveHost):
+            self.host.ui_thread_ident = threading.get_ident()
         interval = max(1.0, float(self.config.refresh_host_s))
         self.set_interval(interval, self.refresh_host)
         self.refresh_host()
@@ -766,8 +771,15 @@ class StopApp(App[None]):
             self._tick_turn_stream(selected)
             self.query_one(EventStrip).show(snap)
             self._errors = 0
+            METRICS.bump_render_revision()
+            if METRICS.snapshot_count and METRICS.snapshot_count % 30 == 0:
+                try:
+                    METRICS.flush()
+                except OSError:
+                    pass
         except Exception as exc:  # noqa: BLE001 — keep TUI alive
             self._errors += 1
+            METRICS.note_refresh_error()
             self.query_one(EventStrip).update(
                 f"[red]refresh error ({self._errors}): {_plain(str(exc)[:80])}[/red]"
             )
