@@ -2,7 +2,12 @@
 # Reload the stop TUI *inside* the existing shared GNU screen session.
 #
 # HARD RULE: never kill, quit, or recreate the `stop` screen.
-# Mark attaches with `screen -x stop` — destroying that session forces a rejoin.
+# Mark attaches with `screen -x stop` / `screen -r stop` — destroying that
+# session forces a rejoin.
+#
+# HARD RULE: if someone is *attached* to the session, do not restart the TUI
+# unless STOP_RELOAD_FORCE=1. Restarting `stop` resets selection, scroll, and
+# pane state mid-session even though the screen name survives.
 #
 # Usage (on moya as rizzn):
 #   ~/sanctum/repos/stop/tools/reload-in-screen.sh
@@ -19,6 +24,21 @@ if ! screen -ls 2>&1 | grep -qE "[0-9]+\.${SCREEN_NAME}[[:space:]]"; then
   echo "Do NOT auto-create it from automation while Mark may be attached elsewhere." >&2
   echo "If Mark asks to recreate: screen -dmS ${SCREEN_NAME} -h 20000 bash -l" >&2
   exit 2
+fi
+
+# screen -ls lines look like:
+#   1748042.stop   (09/17/2026 06:07:33 PM)   (Attached)
+#   1748042.stop   (09/17/2026 06:07:33 PM)   (Detached)
+attached=0
+if screen -ls 2>&1 | grep -qE "[0-9]+\.${SCREEN_NAME}[[:space:]].*\(Attached\)"; then
+  attached=1
+fi
+
+if [[ "$attached" -eq 1 && "${STOP_RELOAD_FORCE:-}" != "1" ]]; then
+  echo "SKIP: screen '${SCREEN_NAME}' is Attached — not restarting TUI (would reset the live view)." >&2
+  echo "Code is on disk; next cold start / Detached reload picks it up." >&2
+  echo "To force anyway: STOP_RELOAD_FORCE=1 $0" >&2
+  exit 0
 fi
 
 # Quit the TUI only (binding `q`). Requires stop was started WITHOUT `exec`
