@@ -67,9 +67,8 @@ if [[ "$attached" -eq 1 && "${STOP_RELOAD_FORCE:-}" != "1" ]]; then
 fi
 
 # Quit the TUI only (binding `q`). Requires stop was started WITHOUT `exec`
-# so bash stays alive inside the screen. Never send commands that kill screen.
-# Forbidden patterns (enforced by tests): -X quit, -X kill, -S ... -X kill,
-# screen -wipe that removes the session, etc.
+# so bash stays alive inside the screen. Never destroy the GNU screen session
+# (no session quit/kill/wipe). Tests assert this script never invokes those.
 screen -S "$SESSION_ID" -X stuff 'q'
 sleep 0.6
 # shellcheck disable=SC2086
