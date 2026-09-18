@@ -802,18 +802,18 @@ class TurnStreamWorker:
             text = (text or "").strip()
             if not text:
                 return
+            changed = False
             with self._lock:
                 cur = (self.state.text or "").strip()
                 q = self.state.query
-                # Capture query if poll only has user_message so far.
-                if not q:
-                    # messages_to_text skips user_message; poller may pass raw rows via side path
-                    pass
                 display = with_query_header(text, q)
                 if _is_placeholder(cur) or len(display) >= len(cur):
-                    self.state.text = display[-12000:]
-                    self.state.status = "streaming"
-            self._notify()
+                    if display != self.state.text:
+                        self.state.text = display[-12000:]
+                        self.state.status = "streaming"
+                        changed = True
+            if changed:
+                self._notify()
 
         def _poll_messages() -> None:
             """SSE is step-batched and blocks on readline — poll messages so UI

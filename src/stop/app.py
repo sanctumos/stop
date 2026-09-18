@@ -260,6 +260,7 @@ class WindowPane(Vertical):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._feed = LiveLogFeed(limit=400, width=200)
+        self._turn_feed = LiveLogFeed(limit=400, width=500)
         self._agent: Agent | None = None
         self._win_index = 0
         self._turn_visible = False
@@ -362,7 +363,7 @@ class WindowPane(Vertical):
         self._feed.sync(log, w.last_scrollback, source_key=source_key)
 
     def show_turn(self, state: TurnStreamState) -> None:
-        """Show/hide the turn-stream overlay under the selected log."""
+        """Show/hide the turn-stream overlay; append-only body updates (#4065)."""
         panel = self.query_one("#turn-panel")
         meta = self.query_one("#turn-meta", Static)
         log = self.query_one("#turn-log", RichLog)
@@ -373,8 +374,8 @@ class WindowPane(Vertical):
             self._turn_visible = want
             if not want:
                 self._turn_body = None
+                self._turn_feed.reset()
                 log.clear()
-            # Absolute overlay must not touch #win-log scroll or geometry.
         if not want:
             return
         elapsed = ""
@@ -401,37 +402,34 @@ class WindowPane(Vertical):
             meta,
             f"[b]{mode}[/b]  [dim]{elapsed}{nchars} chars · follows end · t off[/dim]",
         )
-        # Cap + plain lines for RichLog (markup=False).
         lines = body.splitlines() or [body]
         if len(lines) > 350:
             lines = ["…"] + lines[-349:]
-        key = "\n".join(lines)
+        cleaned_lines: list[str] = []
+        for ln in lines:
+            cleaned = "".join(ch if ch >= " " or ch in "\t" else "?" for ch in ln)
+            cleaned_lines.append(cleaned[:500])
+        key = "\n".join(cleaned_lines)
         if key == self._turn_body and not revealing:
-            # Still nudge scroll on live ticks so the end stays visible.
-            if state.status in ("streaming", "linger") and log.size.width > 0:
-                try:
-                    log.scroll_end(animate=False)
-                except Exception:
-                    pass
+            # Identical body — do not scroll_end (that looked like thrash).
             return
         self._turn_body = key
+        # Seeking→streaming with same run keeps append; run change replaces.
+        if state.run_id:
+            source_key = f"{state.agent_name}:{state.run_id}"
+        else:
+            source_key = f"{state.agent_name}:{state.status}"
 
         def _paint_log() -> None:
             if not self._turn_visible:
                 return
-            # Read latest body at paint time (reveal may lag a frame).
-            latest = self._turn_body or ""
-            paint_lines = latest.splitlines() or [latest]
-            log.clear()
-            for ln in paint_lines:
-                cleaned = "".join(
-                    ch if ch >= " " or ch in "\t" else "?" for ch in ln
-                )
-                log.write(cleaned[:500], scroll_end=True)
-            try:
-                log.scroll_end(animate=False)
-            except Exception:
-                pass
+            mode_used = self._turn_feed.sync(
+                log, "\n".join(cleaned_lines), source_key=source_key
+            )
+            if mode_used == "noop":
+                METRICS.note_turn_dropped()
+            else:
+                METRICS.note_turn_applied()
 
         if revealing or log.size.width <= 0:
             self.call_after_refresh(_paint_log)
@@ -658,6 +656,8 @@ class StopApp(App[None]):
         self._painted_rev = -1
         self._last_collect_error = ""
         self._turn: TurnStreamWorker | None = None
+        self._turn_coalesce = False
+        self._turn_dirty = False
         self._collector = HostCollector(host, on_update=self._on_collector_update)
         if isinstance(self.host, LiveHost):
             self.host.hardcopy_interval_s = float(self.config.refresh_hardcopy_s)
@@ -674,11 +674,27 @@ class StopApp(App[None]):
             pass
 
     def _on_turn_update(self) -> None:
-        """Worker thread → UI thread: repaint turn pane immediately."""
+        """Worker thread → UI: coalesce paints to ~70ms (#4065)."""
+        if self._turn_coalesce:
+            self._turn_dirty = True
+            METRICS.note_turn_coalesced()
+            return
+        self._turn_coalesce = True
         try:
-            self.call_from_thread(self._paint_turn_from_worker)
+            self.call_from_thread(self._schedule_turn_paint)
         except Exception:
-            pass
+            self._turn_coalesce = False
+
+    def _schedule_turn_paint(self) -> None:
+        self.set_timer(0.07, self._flush_turn_paint)
+
+    def _flush_turn_paint(self) -> None:
+        self._turn_coalesce = False
+        self._paint_turn_from_worker()
+        if self._turn_dirty:
+            self._turn_dirty = False
+            self._turn_coalesce = True
+            self.set_timer(0.07, self._flush_turn_paint)
 
     def _paint_turn_from_worker(self) -> None:
         if self._turn is None:
