@@ -338,10 +338,24 @@ def test_toggle_off_clears_active(tmp_path: Path):
     assert snap.text == ""
 
 
-def test_linger_ignores_new_turn_signals(tmp_path: Path):
-    """Lagging Broca lines during linger must not wipe the completed turn text."""
+def test_wrapped_live_mode_line_arms_popup():
+    """Broca's 80-column screen splits LIVE mode across two physical lines."""
+    now = time.time()
+    ts = _ts(now)
+    prev = f"[{ts}] INFO idle\n"
+    new = (
+        prev
+        + f"[{ts}] INFO runtime.core.queue: Processing message in LIVE m\n"
+        + "ode (queue timeout 120s)\n"
+    )
+    assert scrollback_signals_turn_start(prev, new, now=now) is True
+
+
+def test_linger_keeps_finished_text_until_a_new_turn(tmp_path: Path):
+    """Repeated old lines during linger must not wipe the completed turn."""
     w = TurnStreamWorker(agents_root=tmp_path)
     now = time.time()
+    old = _live(now - 30)
     with w._lock:
         w.state = TurnStreamState(
             enabled=True,
@@ -352,20 +366,41 @@ def test_linger_ignores_new_turn_signals(tmp_path: Path):
             text="HELLO FROM TURN\n— turn complete —",
             linger_until=now + 60.0,
         )
-    w._prev_scroll["athena"] = _live(now - 30)
+    w._prev_scroll["athena"] = old
     w.tick(
         selected_agent="athena",
-        broca_scrollback=(
-            _live(now - 30)
-            + f'[{_ts(now)}] INFO HTTP Request: POST http://localhost:8284/v1/agents/a/messages "HTTP/1.1 200 OK"\n'
-            + _live(now)  # even a real-looking fresh line
-        ),
+        broca_scrollback=old
+        + f'[{_ts(now)}] INFO HTTP Request: POST http://localhost:8284/v1/agents/a/messages "HTTP/1.1 200 OK"\n',
         now=now,
     )
     snap = w.snapshot()
     assert snap.status == "linger"
     assert "HELLO FROM TURN" in snap.text
-    assert "waiting for Letta run" not in snap.text
+
+
+def test_linger_yields_to_the_next_fresh_turn(tmp_path: Path):
+    w = TurnStreamWorker(agents_root=tmp_path)
+    now = time.time()
+    old = _live(now - 30)
+    with w._lock:
+        w.state = TurnStreamState(
+            enabled=True,
+            active=True,
+            lingering=True,
+            agent_name="athena",
+            status="linger",
+            text="HELLO FROM TURN\n— turn complete —",
+            linger_until=now + 60.0,
+        )
+    w._prev_scroll["athena"] = old
+    w.tick(
+        selected_agent="athena",
+        broca_scrollback=old + _live(now),
+        now=now,
+    )
+    snap = w.snapshot()
+    assert snap.status in ("seeking", "error")
+    assert "HELLO FROM TURN" not in snap.text
 
 
 def test_empty_hardcopy_does_not_reset_cursor(tmp_path: Path):

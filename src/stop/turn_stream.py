@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from .livelog import unwrap_screen_hardcopy
+
 # Broca console lines that mean a Letta turn just began.
 # Keep this tight: httpx "POST …/messages 200" logs when the request *finishes*
 # (after the turn), and would re-trigger a seek that wipes the linger panel.
@@ -105,11 +107,12 @@ def scrollback_signals_turn_start(
     if not (new or "").strip():
         return False
     now = now if now is not None else time.time()
-    # hardcopy can embed NULs / C1 controls — normalize before compare.
+    # hardcopy can embed NULs / C1 controls. Broca screens are 80 columns,
+    # so "LIVE mode" arrives as "LIVE m" / "ode" until the lines are rejoined.
     prev = (prev or "").replace("\x00", "")
     new = (new or "").replace("\x00", "")
-    old_lines = prev.splitlines()
-    new_lines = new.splitlines()
+    old_lines = unwrap_screen_hardcopy(prev)
+    new_lines = unwrap_screen_hardcopy(new)
     if new_lines == old_lines:
         return False
     if len(new_lines) >= len(old_lines) and new_lines[: len(old_lines)] == old_lines:
@@ -739,6 +742,7 @@ class TurnStreamWorker:
         self._cooldown_until: dict[str, float] = {}
         self._generation = 0
         self._pending_agents: list[str] = []
+        self._followup_agent: str | None = None
         self._selected_agent: str | None = None
         self._probe_thread: threading.Thread | None = None
         self._probe_after = 0.0
@@ -768,6 +772,7 @@ class TurnStreamWorker:
                 self.state.pending_agents = []
                 self._seek_agent = None
                 self._pending_agents = []
+                self._followup_agent = None
                 thread = self._thread
             else:
                 self._stop_event.clear()
@@ -784,6 +789,7 @@ class TurnStreamWorker:
                     self.state.pending_agents = []
                     self._seek_agent = None
                     self._pending_agents = []
+                    self._followup_agent = None
         if thread is not None and thread.is_alive():
             thread.join(timeout=self.DISABLE_JOIN_S)
 
@@ -887,11 +893,26 @@ class TurnStreamWorker:
             if scrollback_signals_turn_start(prev, new, now=now):
                 started.append(name)
 
+        # A finished popup may still be on screen. The next real turn for
+        # the agent you are watching has to replace it, or that turn is lost.
+        if busy and selected_agent in started and status == "linger":
+            with self._lock:
+                self.state.lingering = False
+                self.state.active = False
+                self.state.status = "idle"
+                self.state.text = ""
+                self.state.query = ""
+                self.state.saw_waiting_query = False
+                self.state.error = ""
+                self.state.run_id = ""
+            busy = False
+
         if busy:
-            # Queue background starts; never interrupt the focused turn.
+            # Queue background starts; never interrupt an in-flight focused turn.
             changed = False
             for name in started:
                 if name == selected_agent:
+                    self._followup_agent = name
                     continue
                 if name not in self._pending_agents:
                     self._pending_agents.append(name)
@@ -1469,6 +1490,25 @@ class TurnStreamWorker:
             rows = fetch_run_messages(creds, run_id)
             api_text = ordered_unique_message_text(rows)
             status = fetch_run_status(creds, run_id)
+
+        follow = None
+        with self._lock:
+            if self._followup_agent == creds.agent_name:
+                follow = self._followup_agent
+                self._followup_agent = None
+        if follow and self._gen_ok(gen):
+            with self._lock:
+                if gen == self._generation and self.state.enabled:
+                    self.state.active = False
+                    self.state.lingering = False
+                    self.state.status = "idle"
+                    self.state.text = ""
+                    self.state.query = ""
+                    self.state.saw_waiting_query = False
+                    self.state.error = ""
+                    self.state.run_id = ""
+            self._start_seek(creds, since=time.time())
+            return
 
         # A completed run's messages endpoint is authoritative. The previous
         # length-based merge could retain a longer reasoning trace and discard
