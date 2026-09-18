@@ -636,9 +636,18 @@ class TurnStreamWorker:
                 self._set_query_and_waiting(
                     query=query, run_id=run_id, agent_name=creds.agent_name
                 )
+                # Dwell so the popup paints the ask before step text replaces it
+                # (user_message and first step often arrive in the same poll).
+                if not early:
+                    time.sleep(0.15)
             if early:
+                if query:
+                    # Ensure at least one waiting+query frame before content.
+                    self._set_query_and_waiting(
+                        query=query, run_id=run_id, agent_name=creds.agent_name
+                    )
+                    time.sleep(0.45)
                 break
-            # Keep looping until we have the query (or steps appear / timeout).
             if query:
                 break
             time.sleep(0.1)
