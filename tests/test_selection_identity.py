@@ -8,12 +8,20 @@ from unittest.mock import patch
 
 from textual.widgets import RichLog
 
-from stop.app import AgentList, StopApp, WindowPane
+from stop.app import AgentList, StopApp, WindowPane, agent_selector_label
 from stop.host import FixtureHost
 from stop.models import Agent, Window, WindowState
 from stop.selection import resolve_agent_selection, resolve_window_selection
 
 FIXTURE = Path(__file__).parent / "fixtures" / "basic"
+
+
+def test_system_pseudo_agent_is_labeled_and_filterable_as_letta_kernel():
+    agents = AgentList()
+    agents.agents = [Agent(name="System")]
+    agents.filter = "letta-kernel"
+    assert agent_selector_label("System") == "letta-kernel"
+    assert [a.name for a in agents.visible()] == ["System"]
 
 
 def _agent(name: str, *win_ids: str) -> Agent:

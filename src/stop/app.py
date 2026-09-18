@@ -24,6 +24,11 @@ from .state import badge_label, is_failure, short_badge
 from .turn_stream import TurnStreamState, TurnStreamWorker
 
 
+def agent_selector_label(name: str) -> str:
+    """User-facing selector label; internal pseudo-agent identity stays stable."""
+    return "letta-kernel" if name == "System" else name
+
+
 def _state_style(state: WindowState) -> str:
     if is_failure(state):
         return "bold red"
@@ -229,7 +234,11 @@ class AgentList(Static):
         if not self.filter:
             return self.agents
         q = self.filter.lower()
-        return [a for a in self.agents if q in a.name.lower()]
+        return [
+            a
+            for a in self.agents
+            if q in a.name.lower() or q in agent_selector_label(a.name).lower()
+        ]
 
     def selected(self) -> Agent | None:
         vis = self.visible()
@@ -272,7 +281,8 @@ class AgentList(Static):
             if a.state == WindowState.UNMANAGED and not a.started_at_epoch:
                 uptime = "-"
             # Compact one-liner for ~28 usable cols.
-            lines.append(f"{mark} [{style}]{a.name}[/{style}] {badge} {uptime}")
+            label = agent_selector_label(a.name)
+            lines.append(f"{mark} [{style}]{label}[/{style}] {badge} {uptime}")
         title = "agents"
         if self.filter:
             title += f" /{self.filter}"
