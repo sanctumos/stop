@@ -507,7 +507,10 @@ class TurnStreamWorker:
         with self._lock:
             self.state.run_id = run_id
             self.state.status = "streaming"
-            self.state.text = f"Streaming {run_id}…\n"
+            self.state.text = (
+                f"Live on {run_id}…\n"
+                "(step stream — text appears when each model step finishes, not per-token)\n"
+            )
         self._notify()
         # Catch-up from messages API in case SSE is empty / already drained.
         early = messages_to_text(fetch_run_messages(creds, run_id))
@@ -534,6 +537,36 @@ class TurnStreamWorker:
         )
         buf_lines: list[str] = []
         stream_error = ""
+        poll_stop = threading.Event()
+
+        def _apply_text(text: str) -> None:
+            text = (text or "").strip()
+            if not text:
+                return
+            with self._lock:
+                cur = (self.state.text or "").strip()
+                placeholder = cur.startswith("Streaming ") or cur.startswith("Live on ")
+                if placeholder or len(text) >= len(cur):
+                    self.state.text = text[-12000:]
+                    self.state.status = "streaming"
+            self._notify()
+
+        def _poll_messages() -> None:
+            """SSE is step-batched and blocks on readline — poll messages so UI
+            updates as soon as a step lands, not only when the socket unblocks."""
+            while not poll_stop.is_set() and not self._stop_event.is_set():
+                try:
+                    msg_text = messages_to_text(fetch_run_messages(creds, run_id))
+                    if msg_text:
+                        _apply_text(msg_text)
+                except Exception:
+                    pass
+                poll_stop.wait(0.7)
+
+        poller = threading.Thread(
+            target=_poll_messages, name=f"turn-poll-{run_id[-8:]}", daemon=True
+        )
+        poller.start()
         try:
             with urllib.request.urlopen(req, timeout=600) as resp:
                 while not self._stop_event.is_set():
@@ -559,7 +592,7 @@ class TurnStreamWorker:
                     piece = format_stream_event(obj)
                     if not piece:
                         continue
-                    # Token deltas: append; full reasoning blocks: new paragraph.
+                    # Step chunks: full reasoning/tool blocks as paragraphs.
                     if piece.startswith("[think]") or piece.startswith("[tool"):
                         buf_lines.append(piece)
                         buf_lines.append("")
@@ -568,24 +601,24 @@ class TurnStreamWorker:
                             buf_lines[-1] = buf_lines[-1] + piece
                         else:
                             buf_lines.append(piece)
-                    text = "\n".join(buf_lines).strip()
-                    with self._lock:
-                        self.state.text = text[-12000:]
-                        self.state.status = "streaming"
-                    self._notify()
+                    _apply_text("\n".join(buf_lines))
         except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as exc:
             stream_error = str(exc)[:200]
             with self._lock:
                 self.state.error = stream_error
-                if not self.state.text.strip() or self.state.text.startswith("Streaming "):
+                if not self.state.text.strip() or self.state.text.startswith(
+                    ("Streaming ", "Live on ")
+                ):
                     self.state.text = f"[stream error] {exc}"
             self._notify()
+        finally:
+            poll_stop.set()
 
         text_now = "\n".join(buf_lines).strip()
         if len(text_now) < 40:
             with self._lock:
                 prior = (self.state.text or "").strip()
-            if prior and not prior.startswith("Streaming ") and not prior.startswith(
+            if prior and not prior.startswith(("Streaming ", "Live on ")) and not prior.startswith(
                 "[stream error]"
             ):
                 text_now = prior.replace("\n\n— turn complete —", "").strip()
@@ -598,7 +631,7 @@ class TurnStreamWorker:
         with self._lock:
             if text_now:
                 self.state.text = text_now[-12000:]
-            elif (self.state.text or "").startswith("Streaming "):
+            elif (self.state.text or "").startswith(("Streaming ", "Live on ")):
                 self.state.text = (
                     f"No stream content for {run_id}."
                     + (f" ({stream_error})" if stream_error else "")

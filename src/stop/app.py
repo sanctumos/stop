@@ -131,7 +131,7 @@ class HelpScreen(ModalScreen[None]):
             "Active Now follows human/agent dialogue — not otto_bridge chatter.\n"
             "Bottom row: Active Now (left) + Letta console (right).\n"
             "Turn stream: Broca turn-start → Letta /v1/runs/{id}/stream;\n"
-            "  splits under the selected agent log, lingers 60s, hotkey t.\n"
+            "  step chunks (not per-token); pane follows the bottom; linger 60s; t toggles.\n"
             "stop screen is never hardcopied into this TUI.\n"
             "Log lines with [brackets] are escaped (cannot crash UI).\n\n"
             "[dim]Esc / q / ? to close[/dim]",
@@ -304,7 +304,15 @@ class WindowPane(Vertical):
         )
         with Vertical(id="turn-panel"):
             yield Static(id="turn-meta")
-            yield Static(id="turn-log")
+            yield RichLog(
+                id="turn-log",
+                max_lines=400,
+                min_width=20,
+                wrap=True,
+                highlight=False,
+                markup=False,
+                auto_scroll=True,
+            )
 
     def on_mount(self) -> None:
         self.query_one("#turn-panel").display = False
@@ -376,7 +384,7 @@ class WindowPane(Vertical):
         """Show/hide the turn-stream split under the selected log."""
         panel = self.query_one("#turn-panel")
         meta = self.query_one("#turn-meta", Static)
-        log = self.query_one("#turn-log", Static)
+        log = self.query_one("#turn-log", RichLog)
         want = bool(state.enabled and state.active and (state.text or state.error))
         revealing = want and not self._turn_visible
         if want != self._turn_visible:
@@ -384,38 +392,69 @@ class WindowPane(Vertical):
             self._turn_visible = want
             if not want:
                 self._turn_body = None
-                log.update("")
+                log.clear()
         if not want:
             return
+        elapsed = ""
+        if state.started_at:
+            elapsed = f"{max(0, int(time.time() - state.started_at))}s · "
         if state.status == "linger":
             title = f"turn · {state.agent_name} · linger"
+            mode = "linger"
         elif state.status == "seeking":
             title = f"turn · {state.agent_name} · seeking run…"
+            mode = "seeking"
         elif state.status == "error":
             title = f"turn · {state.agent_name} · error"
+            mode = "error"
         else:
             rid = (state.run_id or "")[-12:]
-            title = f"turn · {state.agent_name} · streaming {rid}"
+            title = f"turn · {state.agent_name} · live {rid}"
+            mode = "step-stream"
         _set_title(panel, title)
         err = f"\n[error] {state.error}" if state.error else ""
         body = (state.text or "") + err
         nchars = len(body)
         _paint(
             meta,
-            f"[b]{state.status}[/b]  [dim]{nchars} chars · t toggles off[/dim]",
+            f"[b]{mode}[/b]  [dim]{elapsed}{nchars} chars · follows end · t off[/dim]",
         )
-        # Static + escaped markup — RichLog was staying blank after reveal (0×0 paint).
-        plain = _plain(body)
-        # Cap display size so huge reasoning dumps stay usable.
-        if len(plain) > 12000:
-            plain = "…\n" + plain[-12000:]
-        if plain != self._turn_body:
-            self._turn_body = plain
-            if revealing:
-                # Wait one layout pass so the panel has nonzero height.
-                self.call_after_refresh(lambda: log.update(self._turn_body or ""))
-            else:
-                log.update(plain)
+        # Cap + plain lines for RichLog (markup=False).
+        lines = body.splitlines() or [body]
+        if len(lines) > 350:
+            lines = ["…"] + lines[-349:]
+        key = "\n".join(lines)
+        if key == self._turn_body and not revealing:
+            # Still nudge scroll on live ticks so the end stays visible.
+            if state.status in ("streaming", "linger") and log.size.width > 0:
+                try:
+                    log.scroll_end(animate=False)
+                except Exception:
+                    pass
+            return
+        self._turn_body = key
+
+        def _paint_log() -> None:
+            if not self._turn_visible:
+                return
+            # Read latest body at paint time (reveal may lag a frame).
+            latest = self._turn_body or ""
+            paint_lines = latest.splitlines() or [latest]
+            log.clear()
+            for ln in paint_lines:
+                cleaned = "".join(
+                    ch if ch >= " " or ch in "\t" else "?" for ch in ln
+                )
+                log.write(cleaned[:500], scroll_end=True)
+            try:
+                log.scroll_end(animate=False)
+            except Exception:
+                pass
+
+        if revealing or log.size.width <= 0:
+            self.call_after_refresh(_paint_log)
+        else:
+            _paint_log()
 
 
 class ActiveNowPane(Vertical):
@@ -541,11 +580,7 @@ class StopApp(App[None]):
         padding: 0 1;
     }
     #turn-meta { height: 1; }
-    #turn-log {
-        height: 1fr; min-height: 5;
-        overflow-y: auto; overflow-x: hidden;
-        background: transparent;
-    }
+    #turn-log { height: 1fr; min-height: 5; background: transparent; }
     #active {
         width: 1fr; height: 100%;
         border: round $warning;
