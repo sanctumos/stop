@@ -420,7 +420,7 @@ class WindowPane(Vertical):
         panel = self.query_one("#turn-panel")
         meta = self.query_one("#turn-meta", Static)
         log = self.query_one("#turn-log", RichLog)
-        want = bool(state.enabled and state.active and (state.text or state.error))
+        want = bool(state.enabled and state.active)
         revealing = want and not self._turn_visible
         if want != self._turn_visible:
             panel.display = want
@@ -448,8 +448,13 @@ class WindowPane(Vertical):
             title = f"turn · {state.agent_name} · live {rid}"
             mode = "step-stream"
         _set_title(panel, title)
-        err = f"\n[error] {state.error}" if state.error else ""
-        body = (state.text or "") + err
+        # Keep overlay up during long thinking gaps even if text briefly empty.
+        if not (state.text or state.error):
+            body = "…"
+        else:
+            body = (state.text or "") + (
+                f"\n[error] {state.error}" if state.error else ""
+            )
         nchars = len(body)
         _paint(
             meta,

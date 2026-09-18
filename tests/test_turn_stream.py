@@ -385,3 +385,133 @@ def test_background_agent_turn_does_not_replace_focused(tmp_path: Path):
     snap = w.snapshot()
     assert snap.agent_name == "ada"
     assert "rico" in snap.pending_agents
+
+
+def test_run_still_in_flight_and_status_helpers():
+    from stop.turn_stream import run_still_in_flight
+
+    assert run_still_in_flight("running") is True
+    assert run_still_in_flight("created") is True
+    assert run_still_in_flight("") is True  # unknown → keep waiting
+    assert run_still_in_flight("completed") is False
+    assert run_still_in_flight("failed") is False
+
+
+def test_consume_stream_eof_while_running_keeps_going_then_merges_final(
+    tmp_path: Path, monkeypatch
+):
+    """SSE EOF mid-think must not finalize until the run completes; final
+    assistant text comes from the messages API even if [think] was long."""
+    from stop.turn_stream import LettaAgentCreds, TurnStreamWorker
+
+    creds = LettaAgentCreds(
+        agent_name="athena",
+        agent_id="agent-x",
+        api_key="k",
+        endpoint="http://127.0.0.1:9",
+    )
+    w = TurnStreamWorker(agents_root=tmp_path)
+    w.STREAM_WALL_S = 8.0
+    w.SSE_READ_TIMEOUT_S = 1.0
+    w.LINGER_S = 30.0
+
+    statuses = iter(["running", "running", "completed"])
+    monkeypatch.setattr(
+        "stop.turn_stream.fetch_run_status",
+        lambda *a, **k: next(statuses, "completed"),
+    )
+    think = "[think] " + ("x" * 80)
+    final = "FINAL_ASSISTANT_REPLY_HERE"
+    msg_calls = {"n": 0}
+
+    def fake_messages(*a, **k):
+        msg_calls["n"] += 1
+        if msg_calls["n"] < 3:
+            return [
+                {
+                    "id": "t1",
+                    "message_type": "reasoning_message",
+                    "reasoning": "x" * 80,
+                }
+            ]
+        return [
+            {
+                "id": "t1",
+                "message_type": "reasoning_message",
+                "reasoning": "x" * 80,
+            },
+            {
+                "id": "a1",
+                "message_type": "assistant_message",
+                "content": final,
+            },
+        ]
+
+    monkeypatch.setattr("stop.turn_stream.fetch_run_messages", fake_messages)
+
+    class FakeResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def readline(self):
+            # Immediate EOF → old bug treated this as stream_done.
+            return b""
+
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda *a, **k: FakeResp(),
+    )
+
+    with w._lock:
+        w.state.enabled = True
+        w.state.active = True
+        w.state.agent_name = "athena"
+        w.state.query = "hi"
+        w.state.text = "Live on run-1…\n(step stream — waiting for first model step)"
+        w.state.status = "streaming"
+        w._generation = 1
+
+    t0 = time.time()
+    w._consume_stream(creds, "run-1", gen=1)
+    elapsed = time.time() - t0
+    assert elapsed < 7.0, f"consume hung too long: {elapsed:.1f}s"
+    snap = w.snapshot()
+    assert snap.status == "linger"
+    assert snap.active is True
+    assert final in snap.text
+    assert "— turn complete —" in snap.text
+
+
+def test_show_turn_stays_visible_when_active_even_if_text_empty():
+    """Regression: empty text used to hide the overlay mid-think."""
+    import asyncio
+    from pathlib import Path
+
+    from stop.app import StopApp, WindowPane
+    from stop.host import FixtureHost
+    from stop.turn_stream import TurnStreamState
+
+    fixture = Path(__file__).parent / "fixtures" / "basic"
+
+    async def run() -> None:
+        app = StopApp(FixtureHost(fixture))
+        async with app.run_test(size=(160, 45)) as pilot:
+            await pilot.pause(0.1)
+            pane = app.query_one(WindowPane)
+            pane.show_turn(
+                TurnStreamState(
+                    enabled=True,
+                    active=True,
+                    agent_name="athena",
+                    status="streaming",
+                    text="",
+                    started_at=time.time(),
+                )
+            )
+            await pilot.pause(0.05)
+            assert pane.query_one("#turn-panel").display is True
+
+    asyncio.run(run())

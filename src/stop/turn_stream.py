@@ -438,6 +438,29 @@ def list_runs_for_agent(
     return out
 
 
+def fetch_run_status(creds: LettaAgentCreds, run_id: str) -> str:
+    """GET /v1/runs/{id} → lowercase status, or empty on failure."""
+    url = f"{creds.endpoint}/v1/runs/{run_id}"
+    try:
+        data = _http_json("GET", url, api_key=creds.api_key, timeout=8.0)
+    except (
+        urllib.error.URLError,
+        urllib.error.HTTPError,
+        TimeoutError,
+        json.JSONDecodeError,
+        OSError,
+    ):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("status") or "").lower()
+
+
+def run_still_in_flight(status: str) -> bool:
+    """True while Letta may still emit reasoning / assistant tokens."""
+    return status in ("", "running", "created", "pending", "in_progress")
+
+
 def fetch_run_messages(creds: LettaAgentCreds, run_id: str) -> list[dict]:
     """GET /v1/runs/{id}/messages — fallback when SSE yields nothing."""
     url = f"{creds.endpoint}/v1/runs/{run_id}/messages?limit=100&order=asc"
@@ -622,7 +645,11 @@ class TurnStreamWorker:
     # After linger clears, ignore turn traps briefly — unstable hardcopy still
     # carries old LIVE-mode lines and was re-popping the query pane at rest.
     RETRIGGER_COOLDOWN_S = 12.0
+    # Per-socket read idle. Long thinking sends no tokens — reconnect, do not
+    # treat this as turn complete.
     SSE_READ_TIMEOUT_S = 45.0
+    # Hard wall for one turn (seek+stream). Prevents forever-open SSE loops.
+    STREAM_WALL_S = 900.0
     SEEN_RUNS_MAX = 100
     DISABLE_JOIN_S = 2.0
 
@@ -1108,20 +1135,46 @@ class TurnStreamWorker:
         )
         poller.start()
         stream_done = False
+        wall_deadline = time.time() + self.STREAM_WALL_S
         try:
-            # Bounded socket wait; reconnect loop covers long turns.
+            # Bounded socket wait; reconnect while the Letta run is still live.
+            # Idle SSE timeouts during thinking must NOT end the turn.
             while (
                 not stream_done
                 and not self._stop_event.is_set()
                 and self._gen_ok(gen)
             ):
+                if time.time() >= wall_deadline:
+                    stream_error = stream_error or "stream wall clock exceeded"
+                    break
                 try:
                     with urllib.request.urlopen(
                         req, timeout=self.SSE_READ_TIMEOUT_S
                     ) as resp:
                         while not self._stop_event.is_set() and self._gen_ok(gen):
+                            if time.time() >= wall_deadline:
+                                stream_error = stream_error or (
+                                    "stream wall clock exceeded"
+                                )
+                                stream_done = True
+                                break
                             raw = resp.readline()
                             if not raw:
+                                # EOF — only terminal if the run finished.
+                                status = fetch_run_status(creds, run_id)
+                                if run_still_in_flight(status):
+                                    # Keep waiting chrome so the overlay does
+                                    # not blank during long reasoning gaps.
+                                    with self._lock:
+                                        if (
+                                            gen == self._generation
+                                            and self.state.enabled
+                                            and _is_placeholder(self.state.text)
+                                        ):
+                                            self.state.status = "streaming"
+                                    self._notify()
+                                    time.sleep(0.4)
+                                    break  # reconnect outer loop
                                 stream_done = True
                                 break
                             line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
@@ -1131,6 +1184,12 @@ class TurnStreamWorker:
                                 continue
                             payload = line[5:].strip()
                             if payload == "[DONE]":
+                                # Confirm run actually finished — Letta may
+                                # close the observer while still thinking.
+                                status = fetch_run_status(creds, run_id)
+                                if run_still_in_flight(status):
+                                    time.sleep(0.4)
+                                    break  # reconnect
                                 stream_done = True
                                 break
                             try:
@@ -1156,21 +1215,45 @@ class TurnStreamWorker:
                                 else:
                                     buf_lines.append(piece)
                             _apply_text("\n".join(buf_lines))
-                except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as exc:
+                except (
+                    urllib.error.URLError,
+                    urllib.error.HTTPError,
+                    TimeoutError,
+                    OSError,
+                ) as exc:
                     stream_error = str(exc)[:200]
                     if self._stop_event.is_set() or not self._gen_ok(gen):
                         break
-                    # Soft timeout: reconnect if still live.
-                    if "timed out" in stream_error.lower() or isinstance(
-                        exc, TimeoutError
-                    ):
+                    err_l = stream_error.lower()
+                    soft = (
+                        "timed out" in err_l
+                        or "timeout" in err_l
+                        or isinstance(exc, TimeoutError)
+                    )
+                    status = fetch_run_status(creds, run_id)
+                    if soft or run_still_in_flight(status):
+                        # Thinking gap or transient socket — stay on overlay.
+                        with self._lock:
+                            if gen == self._generation and self.state.enabled:
+                                self.state.status = "streaming"
+                                if _is_placeholder(self.state.text) or not (
+                                    self.state.text or ""
+                                ).strip():
+                                    self.state.text = waiting_panel_text(
+                                        agent_name=creds.agent_name,
+                                        run_id=run_id,
+                                        query=self.state.query,
+                                    )
+                        self._notify()
                         time.sleep(0.3)
                         continue
                     with self._lock:
                         if gen != self._generation or not self.state.enabled:
                             break
                         self.state.error = stream_error
-                        if not self.state.text.strip() or _is_placeholder(self.state.text):
+                        if not self.state.text.strip() or _is_placeholder(
+                            self.state.text
+                        ):
                             self.state.text = f"[stream error] {exc}"
                     self._notify()
                     break
@@ -1185,28 +1268,64 @@ class TurnStreamWorker:
             # Disabled / superseded — do not enter linger.
             return
 
+        # Always reconcile against the messages API. Partial [think] buffers
+        # used to skip this when len>40 and hide the real assistant reply.
+        rows = fetch_run_messages(creds, run_id)
+        with self._lock:
+            q = self.state.query
+        if not q:
+            q = extract_user_query(rows)
+        api_text = ordered_unique_message_text(rows)
         text_now = "\n".join(buf_lines).strip()
-        if len(text_now) < 40:
-            with self._lock:
-                prior = (self.state.text or "").strip()
-                q = self.state.query
-            if prior and not _is_placeholder(prior) and not prior.startswith(
-                "[stream error]"
+        with self._lock:
+            prior = (self.state.text or "").strip()
+        for candidate in (text_now, prior, api_text):
+            if not candidate or _is_placeholder(candidate):
+                continue
+            stripped = candidate.replace("\n\n— turn complete —", "").strip()
+            text_now = merge_turn_bodies(text_now, stripped)
+
+        status = fetch_run_status(creds, run_id)
+        still = run_still_in_flight(status) and time.time() < wall_deadline
+        # If the run is still going and we have no terminal event, keep the
+        # overlay up and poll messages until complete or wall clock.
+        if still and self._gen_ok(gen):
+            wait_end = min(wall_deadline, time.time() + 120.0)
+            while (
+                time.time() < wait_end
+                and not self._stop_event.is_set()
+                and self._gen_ok(gen)
             ):
-                # Strip header for length check reuse
-                text_now = prior.replace("\n\n— turn complete —", "").strip()
-            if len(text_now) < 40:
+                status = fetch_run_status(creds, run_id)
                 rows = fetch_run_messages(creds, run_id)
-                if not q:
-                    q = extract_user_query(rows)
-                fallback = ordered_unique_message_text(rows)
-                if fallback:
-                    text_now = fallback
+                api_text = ordered_unique_message_text(rows)
+                if api_text:
+                    _apply_text(api_text)
+                if not run_still_in_flight(status):
+                    break
+                with self._lock:
+                    if gen == self._generation and self.state.enabled:
+                        self.state.status = "streaming"
+                        if _is_placeholder(self.state.text):
+                            self.state.text = waiting_panel_text(
+                                agent_name=creds.agent_name,
+                                run_id=run_id,
+                                query=self.state.query,
+                            )
+                self._notify()
+                time.sleep(0.8)
+            rows = fetch_run_messages(creds, run_id)
+            api_text = ordered_unique_message_text(rows)
+            if api_text:
+                text_now = merge_turn_bodies(
+                    text_now.replace("\n\n— turn complete —", "").strip(),
+                    api_text,
+                )
 
         with self._lock:
             if gen != self._generation or not self.state.enabled:
                 return
-            q = self.state.query
+            q = self.state.query or q
             if text_now:
                 merged = merge_turn_bodies(
                     self.state.text.replace("\n\n— turn complete —", "").strip(),
@@ -1222,6 +1341,7 @@ class TurnStreamWorker:
             thin = len(final) < 40
             self.state.status = "error" if (stream_error and thin) else "linger"
             self.state.lingering = True
+            self.state.active = True
             self.state.linger_until = time.time() + self.LINGER_S
             if final and not final.endswith("— turn complete —"):
                 self.state.text = final + "\n\n— turn complete —"
