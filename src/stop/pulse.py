@@ -9,7 +9,9 @@ from .activity import KIND_NOISE, classify_line
 from .livelog import unwrap_screen_hardcopy
 from .models import Agent
 
-GLYPHS = "▁▂▃▄▅▆▇█"
+# Eighth-blocks (▁▂▃…) render as diamonds in the font on moya's screen.
+# These are plain ASCII, same idea as the host meters avoiding shade glyphs.
+GLYPHS = ".:-=+*#"
 
 
 def activity_text(agent: Agent) -> str:
