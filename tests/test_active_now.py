@@ -151,28 +151,34 @@ def test_newer_one_line_beats_older_many_dialogue_hits():
     assert pick_active_now(agents).id == "aaa/broca"
 
 
-def test_newer_meaningful_signal_beats_stale_dialogue():
+def test_wrapped_inbound_record_stays_dialogue_and_beats_newer_signal():
     now = time.time()
-    stale_dialogue = Window(
-        id="athena/broca",
-        label="broca-athena",
-        screen_name="broca-athena",
-        state=WindowState.RUNNING,
-        last_activity_epoch=now - 1200,
-        last_scrollback="telegram inbound from Mark\n",
-    )
-    current_turn = Window(
+    ada_dialogue = Window(
         id="ada/broca",
         label="broca-ada",
         screen_name="broca-ada",
         state=WindowState.RUNNING,
+        last_activity_epoch=now - 60,
+        last_scrollback=(
+            "[2026-09-18 12:49:41] INFO "
+            "plugins.telegram_bot.message_handler: Coalesced\n"
+            "inbound queued message_id=841 parts=1\n"
+        ),
+    )
+    porter_error = Window(
+        id="porter/broca",
+        label="broca-porter",
+        screen_name="broca-porter",
+        state=WindowState.RUNNING,
         last_activity_epoch=now,
-        last_scrollback="runtime.core.agent: Stream processing timed out\n",
+        last_scrollback="Error polling partner-bridge inbox: DNS failure\n",
     )
     agents = [
-        Agent(name="athena", cron_managed=True, windows=[stale_dialogue]),
-        Agent(name="ada", cron_managed=True, windows=[current_turn]),
+        Agent(name="ada", cron_managed=True, windows=[ada_dialogue]),
+        Agent(name="porter", cron_managed=True, windows=[porter_error]),
     ]
+    kind, _, _ = classify_scrollback(ada_dialogue.last_scrollback)
+    assert kind == KIND_DIALOGUE
     assert pick_active_now(agents).id == "ada/broca"
 
 

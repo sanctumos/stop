@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from datetime import datetime
 
+from .livelog import unwrap_screen_hardcopy
 from .models import EXCLUDED_SCREEN_NAMES, Agent, Window, WindowState
 
 # Infrastructure chatter that must not steal Active Now.
@@ -74,7 +75,7 @@ def classify_scrollback(text: str, *, lookback: int = 40) -> tuple[int, int, str
     Returns (best_kind, dialogue_hits, preview_line).
     best_kind is the strongest kind among the last `lookback` lines (dialogue > other > noise).
     """
-    lines = [ln for ln in (text or "").splitlines() if ln.strip()][-lookback:]
+    lines = [ln for ln in unwrap_screen_hardcopy(text) if ln.strip()][-lookback:]
     if not lines:
         return KIND_NOISE, 0, ""
     best = KIND_NOISE
@@ -97,8 +98,8 @@ def classify_scrollback(text: str, *, lookback: int = 40) -> tuple[int, int, str
 
 def scrollback_delta_is_noise_only(old: str, new: str) -> bool:
     """True when the new text only added noise (or nothing meaningful)."""
-    old_lines = (old or "").splitlines()
-    new_lines = (new or "").splitlines()
+    old_lines = unwrap_screen_hardcopy(old)
+    new_lines = unwrap_screen_hardcopy(new)
     if new_lines == old_lines:
         return True
     # Lines present in new but not as a suffix match of old — approximate delta.
@@ -114,7 +115,7 @@ def scrollback_delta_is_noise_only(old: str, new: str) -> bool:
 
 def latest_meaningful_log_epoch(text: str) -> float:
     """Timestamp of the newest non-noise log record in screen hardcopy."""
-    for line in reversed((text or "").splitlines()):
+    for line in reversed(unwrap_screen_hardcopy(text)):
         match = _LOG_TIMESTAMP_RE.match(line)
         if not match or classify_line(line) == KIND_NOISE:
             continue
@@ -150,12 +151,12 @@ def rank_active_windows(
     *,
     exclude_screens: frozenset[str] | None = None,
 ) -> list[Window]:
-    """Windows sorted for Active Now: meaningful time → class → hits → id.
+    """Windows sorted for Active Now: class → meaningful time → hits → id.
 
-    The most recent *meaningful* ``last_activity_epoch`` wins. Noise receives
-    epoch zero, so fresh bridge/HTTP chatter cannot steal the pane. Class and
-    dialogue-hit count only break timestamp ties; stable ``window.id`` breaks
-    remaining ties so equal timestamps do not flip.
+    Dialogue beats infrastructure signals, which beat noise. Within a class,
+    the most recent *meaningful* ``last_activity_epoch`` wins. Reconstructing
+    hardcopy records before classification keeps split ``Coalesced``/``inbound``
+    lines in the dialogue class. Stable ``window.id`` breaks remaining ties.
     """
     exclude = exclude_screens if exclude_screens is not None else EXCLUDED_SCREEN_NAMES
     candidates: list[Window] = []
@@ -177,7 +178,7 @@ def rank_active_windows(
         # Noise-only windows sort to the bottom even if their raw capture is newest.
         epoch = w.last_activity_epoch if kind >= KIND_OTHER else 0.0
         # Ascending on negated primaries + id → deterministic, no flip-flops.
-        return (-epoch, -kind, -hits, w.id)
+        return (-kind, -epoch, -hits, w.id)
 
     candidates.sort(key=_key)
     return candidates
