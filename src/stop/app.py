@@ -290,7 +290,6 @@ class WindowPane(Vertical):
         self._win_index = 0
         self._turn_visible = False
         self._turn_body: str | None = None
-        self._turn_paint_pending = False
 
     def compose(self) -> ComposeResult:
         yield Static(id="win-meta")
@@ -305,15 +304,7 @@ class WindowPane(Vertical):
         )
         with Vertical(id="turn-panel"):
             yield Static(id="turn-meta")
-            yield RichLog(
-                id="turn-log",
-                max_lines=300,
-                min_width=20,
-                wrap=True,
-                highlight=False,
-                markup=False,
-                auto_scroll=True,
-            )
+            yield Static(id="turn-log")
 
     def on_mount(self) -> None:
         self.query_one("#turn-panel").display = False
@@ -385,7 +376,7 @@ class WindowPane(Vertical):
         """Show/hide the turn-stream split under the selected log."""
         panel = self.query_one("#turn-panel")
         meta = self.query_one("#turn-meta", Static)
-        log = self.query_one("#turn-log", RichLog)
+        log = self.query_one("#turn-log", Static)
         want = bool(state.enabled and state.active and (state.text or state.error))
         revealing = want and not self._turn_visible
         if want != self._turn_visible:
@@ -393,7 +384,7 @@ class WindowPane(Vertical):
             self._turn_visible = want
             if not want:
                 self._turn_body = None
-                log.clear()
+                log.update("")
         if not want:
             return
         if state.status == "linger":
@@ -413,34 +404,18 @@ class WindowPane(Vertical):
             meta,
             f"[b]{state.status}[/b]  [dim]{nchars} chars · t toggles off[/dim]",
         )
-        # Do not use LiveLogFeed here — its hardcopy noop/truncation guards can
-        # swallow the first paint while the panel is still size 0×0 after reveal.
-        if body != self._turn_body:
-            self._turn_body = body
-            if revealing or log.size.width <= 0:
-                self._turn_paint_pending = True
-                self.call_after_refresh(self._paint_turn_log)
+        # Static + escaped markup — RichLog was staying blank after reveal (0×0 paint).
+        plain = _plain(body)
+        # Cap display size so huge reasoning dumps stay usable.
+        if len(plain) > 12000:
+            plain = "…\n" + plain[-12000:]
+        if plain != self._turn_body:
+            self._turn_body = plain
+            if revealing:
+                # Wait one layout pass so the panel has nonzero height.
+                self.call_after_refresh(lambda: log.update(self._turn_body or ""))
             else:
-                self._write_turn_log(log, body)
-
-    def _paint_turn_log(self) -> None:
-        if not self._turn_paint_pending:
-            return
-        self._turn_paint_pending = False
-        body = self._turn_body
-        if body is None or not self._turn_visible:
-            return
-        log = self.query_one("#turn-log", RichLog)
-        self._write_turn_log(log, body)
-
-    @staticmethod
-    def _write_turn_log(log: RichLog, body: str) -> None:
-        log.clear()
-        lines = (body or "").splitlines() or [body or ""]
-        # Cap paint volume; newest content at the end (auto_scroll).
-        for ln in lines[-300:]:
-            cleaned = "".join(ch if ch >= " " or ch in "\t" else "?" for ch in ln)
-            log.write(cleaned[:500], scroll_end=True)
+                log.update(plain)
 
 
 class ActiveNowPane(Vertical):
@@ -566,7 +541,11 @@ class StopApp(App[None]):
         padding: 0 1;
     }
     #turn-meta { height: 1; }
-    #turn-log { height: 1fr; background: transparent; min-height: 5; }
+    #turn-log {
+        height: 1fr; min-height: 5;
+        overflow-y: auto; overflow-x: hidden;
+        background: transparent;
+    }
     #active {
         width: 1fr; height: 100%;
         border: round $warning;
