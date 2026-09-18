@@ -19,6 +19,8 @@ class WindowState(str, Enum):
 
 # Sessions that must never appear as agent lanes / Active Now targets.
 EXCLUDED_SCREEN_NAMES = frozenset({"stop", "letta"})
+# Sessions we must never hardcopy (stop = this TUI). Letta is watched in its own pane.
+NEVER_HARDCOPY = frozenset({"stop"})
 
 
 @dataclass(frozen=True)

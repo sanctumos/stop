@@ -12,6 +12,7 @@ from .activity import pick_active_now, scrollback_delta_is_noise_only
 from .discovery import build_agents
 from .models import (
     EXCLUDED_SCREEN_NAMES,
+    NEVER_HARDCOPY,
     CrashEvent,
     HostSnapshot,
     WindowState,
@@ -209,8 +210,10 @@ class LiveHost(HostBackend):
         self._prev_net: tuple[float, int, int] | None = None
 
     def set_focus_screens(self, names: set[str]) -> None:
-        """Prefer hardcopying these screens (selected agent + Active Now)."""
-        self._focus_screens = {n for n in names if n and n not in EXCLUDED_SCREEN_NAMES}
+        """Prefer hardcopying these screens (selected agent + Active Now + letta)."""
+        self._focus_screens = {n for n in names if n and n not in NEVER_HARDCOPY}
+        # Dedicated bottom-right pane always watches Letta when it exists.
+        self._focus_screens.add("letta")
 
     def _read_crontab(self) -> str:
         try:
@@ -263,7 +266,10 @@ class LiveHost(HostBackend):
             for w in agent.windows:
                 if not w.screen_name:
                     continue
-                if w.screen_name in EXCLUDED_SCREEN_NAMES:
+                if w.screen_name in NEVER_HARDCOPY:
+                    continue
+                # Letta is only hardcopied when explicitly focused (always is).
+                if w.screen_name in EXCLUDED_SCREEN_NAMES and w.screen_name not in want:
                     continue
                 if w.state in (WindowState.MISSING, WindowState.UNMANAGED, WindowState.DEAD):
                     continue
@@ -273,12 +279,15 @@ class LiveHost(HostBackend):
                 elif w.screen_name in want:
                     pass
         # Cap hardcopies per tick hard — moya is a 2-core box.
-        want = set(list(want)[:4])
+        # Prefer letta + focused screens when over cap.
+        if len(want) > 4:
+            preferred = [n for n in want if n == "letta" or n in self._focus_screens]
+            rest = [n for n in want if n not in preferred]
+            want = set((preferred + rest)[:4])
 
         for agent in agents:
             for w in agent.windows:
-                if w.screen_name and w.screen_name in EXCLUDED_SCREEN_NAMES:
-                    # Never pull Letta/stop scrollback into the TUI.
+                if w.screen_name and w.screen_name in NEVER_HARDCOPY:
                     continue
                 if (
                     do_hardcopy
@@ -294,7 +303,10 @@ class LiveHost(HostBackend):
                         if stripped != prev_text:
                             # Bridge/httpx noise must not bump activity epoch —
                             # that was flipping Active Now between Brocas.
-                            if not scrollback_delta_is_noise_only(prev_text, stripped):
+                            # Letta pane is display-only — never drives Active Now.
+                            if w.screen_name != "letta" and not scrollback_delta_is_noise_only(
+                                prev_text, stripped
+                            ):
                                 w.last_activity_epoch = now
                         w.last_scrollback = text
                         self._scroll_cache[w.screen_name] = (now, text)
@@ -417,7 +429,7 @@ class LiveHost(HostBackend):
         We hardcopy to a unique path, wait for a non-empty stable size, and
         fall back to the last good cache on failure.
         """
-        if screen_name in EXCLUDED_SCREEN_NAMES:
+        if screen_name in NEVER_HARDCOPY:
             return ""
         cached = self._scroll_cache.get(screen_name)
         cached_text = cached[1] if cached else ""

@@ -120,13 +120,15 @@ class HelpScreen(ModalScreen[None]):
             "Esc          collapse / close help / cancel filter\n"
             "Tab          cycle panes (narrow: page agents→windows→Active Now)\n"
             "a            jump to Active Now\n"
+            "l            jump to Letta pane\n"
             "f            follow-lock / release Active Now\n"
             "/            filter agents\n"
             "?            this help\n"
             "q            quit\n\n"
             "No restart button — cron restarts agents.\n"
             "Active Now follows human/agent dialogue — not otto_bridge chatter.\n"
-            "Letta + stop screens excluded from Active Now.\n"
+            "Bottom row: Active Now (left) + Letta console (right).\n"
+            "stop screen is never hardcopied into this TUI.\n"
             "Log lines with [brackets] are escaped (cannot crash UI).\n\n"
             "[dim]Esc / q / ? to close[/dim]",
             id="help-body",
@@ -408,6 +410,44 @@ class ActiveNowPane(Vertical):
         self._feed.sync(log, window.last_scrollback, source_key=window.id)
 
 
+class LettaPane(Vertical):
+    """Dedicated live view of the letta screen session."""
+
+    can_focus = True
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._feed = LiveLogFeed(limit=200, width=200)
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="letta-meta")
+        yield RichLog(
+            id="letta-log",
+            max_lines=200,
+            min_width=20,
+            wrap=False,
+            highlight=False,
+            markup=False,
+            auto_scroll=False,
+        )
+
+    def show(self, window: Window | None) -> None:
+        meta = self.query_one("#letta-meta", Static)
+        log = self.query_one("#letta-log", RichLog)
+        if window is None:
+            _set_title(self, "letta")
+            _paint(meta, "[dim](letta screen not running)[/dim]")
+            self._feed.reset()
+            log.clear()
+            return
+        style = _state_style(window.state)
+        up = _age(window.started_at_epoch)
+        pid = f" pid={window.last_seen_pid}" if window.last_seen_pid else ""
+        _set_title(self, f"letta · {badge_label(window.state)} · up {up}{pid}")
+        _paint(meta, f"[{style}]{badge_label(window.state)}[/{style}]")
+        self._feed.sync(log, window.last_scrollback, source_key="letta")
+
+
 class EventStrip(Static):
     def show(self, snap: HostSnapshot) -> None:
         if not snap.events:
@@ -439,13 +479,21 @@ class StopApp(App[None]):
     #win-meta { height: auto; max-height: 8; }
     #win-log { height: 1fr; background: transparent; }
     #active {
-        height: 1fr; min-height: 12;
+        width: 1fr; height: 100%;
         border: round $warning;
         padding: 0 1;
     }
     #active-meta { height: auto; max-height: 2; }
     #active-log { height: 1fr; background: transparent; }
-    #agents:focus, #windows:focus, #active:focus { border: round $success; }
+    #bottom { height: 1fr; min-height: 12; }
+    #letta {
+        width: 1fr; height: 100%;
+        border: round $secondary;
+        padding: 0 1;
+    }
+    #letta-meta { height: auto; max-height: 2; }
+    #letta-log { height: 1fr; background: transparent; }
+    #agents:focus, #windows:focus, #active:focus, #letta:focus { border: round $success; }
     #filter { dock: bottom; display: none; height: 3; }
     #filter.visible { display: block; }
 
@@ -462,13 +510,18 @@ class StopApp(App[None]):
     Screen.medium #agents { width: 26; }
 
     Screen.narrow #row { layout: vertical; }
+    Screen.narrow #bottom { layout: vertical; }
     Screen.narrow #agents { width: 1fr; height: 1fr; }
     Screen.narrow #windows { width: 1fr; height: 1fr; display: none; }
-    Screen.narrow #active { height: 1fr; display: none; }
+    Screen.narrow #bottom { height: 1fr; display: none; }
     Screen.narrow.page-windows #agents { display: none; }
     Screen.narrow.page-windows #windows { display: block; }
     Screen.narrow.page-active #agents { display: none; }
-    Screen.narrow.page-active #active { display: block; height: 1fr; }
+    Screen.narrow.page-active #bottom { display: block; height: 1fr; }
+    Screen.narrow.page-active #letta { display: none; }
+    Screen.narrow.page-letta #agents { display: none; }
+    Screen.narrow.page-letta #bottom { display: block; height: 1fr; }
+    Screen.narrow.page-letta #active { display: none; }
 
     Screen.tiny #host { display: none; }
     """
@@ -480,6 +533,7 @@ class StopApp(App[None]):
         Binding("escape", "collapse", "collapse", show=False),
         Binding("tab", "cycle", "cycle", show=False),
         Binding("a", "focus_active", "active"),
+        Binding("l", "focus_letta", "letta"),
         Binding("f", "toggle_follow", "follow"),
         Binding("question_mark", "help", "help"),
         Binding("slash", "filter", "filter"),
@@ -505,7 +559,9 @@ class StopApp(App[None]):
             with Horizontal(id="row"):
                 yield AgentList(id="agents")
                 yield WindowPane(id="windows")
-            yield ActiveNowPane(id="active")
+            with Horizontal(id="bottom"):
+                yield ActiveNowPane(id="active")
+                yield LettaPane(id="letta")
         yield EventStrip(id="events")
         yield Input(placeholder="filter agents… (Enter apply, Esc cancel)", id="filter")
         yield Footer()
@@ -523,7 +579,9 @@ class StopApp(App[None]):
     def _apply_breakpoint(self) -> None:
         size = self.size
         screen = self.screen
-        screen.remove_class("medium", "narrow", "tiny", "page-windows", "page-active")
+        screen.remove_class(
+            "medium", "narrow", "tiny", "page-windows", "page-active", "page-letta"
+        )
         if size.height < 24:
             screen.add_class("tiny")
         if size.width < 80:
@@ -532,8 +590,20 @@ class StopApp(App[None]):
                 screen.add_class("page-windows")
             elif self._narrow_page == "active":
                 screen.add_class("page-active")
+            elif self._narrow_page == "letta":
+                screen.add_class("page-letta")
         elif size.width < 120:
             screen.add_class("medium")
+
+    @staticmethod
+    def _letta_window(snap: HostSnapshot) -> Window | None:
+        for agent in snap.agents:
+            if agent.name != "System":
+                continue
+            for w in agent.windows:
+                if w.screen_name == "letta":
+                    return w
+        return None
 
     def _update_focus_screens(self, selected: Agent | None, active: Window | None) -> None:
         if not isinstance(self.host, LiveHost):
@@ -545,6 +615,7 @@ class StopApp(App[None]):
                     names.add(w.screen_name)
         if active and active.screen_name:
             names.add(active.screen_name)
+        names.add("letta")
         self.host.set_focus_screens(names)
 
     def refresh_host(self) -> None:
@@ -577,6 +648,7 @@ class StopApp(App[None]):
             self.query_one(ActiveNowPane).show(
                 active, locked=self.follow_lock_id is not None
             )
+            self.query_one(LettaPane).show(self._letta_window(snap))
             self.query_one(EventStrip).show(snap)
             self._errors = 0
         except Exception as exc:  # noqa: BLE001 — keep TUI alive
@@ -648,17 +720,18 @@ class StopApp(App[None]):
 
     def action_cycle(self) -> None:
         if "narrow" in self.screen.classes:
-            order = ["agents", "windows", "active"]
-            i = order.index(self._narrow_page)
+            order = ["agents", "windows", "active", "letta"]
+            i = order.index(self._narrow_page) if self._narrow_page in order else 0
             self._narrow_page = order[(i + 1) % len(order)]
             self._apply_breakpoint()
             return
         focused = self.focused
-        ids = ("agents", "windows", "active")
+        ids = ("agents", "windows", "active", "letta")
         widgets = {
             "agents": self.query_one(AgentList),
             "windows": self.query_one(WindowPane),
             "active": self.query_one(ActiveNowPane),
+            "letta": self.query_one(LettaPane),
         }
         current = None
         node = focused
@@ -692,6 +765,12 @@ class StopApp(App[None]):
             self._narrow_page = "active"
             self._apply_breakpoint()
         self.query_one(ActiveNowPane).focus()
+
+    def action_focus_letta(self) -> None:
+        if "narrow" in self.screen.classes:
+            self._narrow_page = "letta"
+            self._apply_breakpoint()
+        self.query_one(LettaPane).focus()
 
     def action_help(self) -> None:
         self.push_screen(HelpScreen())
