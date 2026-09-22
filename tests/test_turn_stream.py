@@ -137,6 +137,27 @@ def test_load_agent_creds(tmp_path: Path):
     assert creds.endpoint == "http://127.0.0.1:8284"
 
 
+def test_load_agent_creds_from_parent_when_broca_has_no_letta_keys(tmp_path: Path):
+    """Q / Porter / Wren: Letta identity lives in agents/<name>/.env."""
+    root = tmp_path / "q"
+    (root / "broca").mkdir(parents=True)
+    (root / ".env").write_text(
+        "AGENT_ID=agent-q\n"
+        "AGENT_API_KEY=q-key\n"
+        "AGENT_ENDPOINT=http://127.0.0.1:8284\n",
+        encoding="utf-8",
+    )
+    (root / "broca" / ".env").write_text(
+        "TELEGRAM_BOT_TOKEN=not-a-letta-key\nLOG_LEVEL=INFO\n",
+        encoding="utf-8",
+    )
+    creds = load_agent_creds(tmp_path, "q")
+    assert creds is not None
+    assert creds.agent_id == "agent-q"
+    assert creds.api_key == "q-key"
+    assert creds.endpoint == "http://127.0.0.1:8284"
+
+
 def test_worker_default_enabled_and_toggle(tmp_path: Path):
     w = TurnStreamWorker(agents_root=tmp_path)
     assert w.snapshot().enabled is True

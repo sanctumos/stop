@@ -162,23 +162,34 @@ class TurnStreamState:
     pending_agents: list[str] = field(default_factory=list)
 
 
-def load_agent_creds(agents_root: Path, agent_name: str) -> LettaAgentCreds | None:
-    """Read AGENT_ID / AGENT_API_KEY / AGENT_ENDPOINT from agents/<name>/broca/.env."""
-    env_path = agents_root / agent_name / "broca" / ".env"
-    if not env_path.is_file():
-        # Some agents keep .env one level up.
-        env_path = agents_root / agent_name / ".env"
-    if not env_path.is_file():
-        return None
+def _parse_env_file(path: Path) -> dict[str, str]:
+    """KEY=value lines from one env file. Empty dict if missing/unreadable."""
+    if not path.is_file():
+        return {}
     vals: dict[str, str] = {}
     try:
-        for line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
             s = line.strip()
             if not s or s.startswith("#") or "=" not in s:
                 continue
             k, _, v = s.partition("=")
             vals[k.strip()] = v.strip().strip("'").strip('"')
     except OSError:
+        return {}
+    return vals
+
+
+def load_agent_creds(agents_root: Path, agent_name: str) -> LettaAgentCreds | None:
+    """Read Letta creds from agents/<name>/.env and/or broca/.env.
+
+    Athena-style agents put AGENT_ID in ``broca/.env``. Q / Porter / Wren keep
+    Letta identity one level up and only Broca/Telegram keys under broca/.
+    Merge parent first, then broca (broca wins on overlap) so both layouts work.
+    """
+    root = agents_root / agent_name
+    vals = _parse_env_file(root / ".env")
+    vals.update(_parse_env_file(root / "broca" / ".env"))
+    if not vals:
         return None
     agent_id = vals.get("AGENT_ID") or ""
     api_key = vals.get("AGENT_API_KEY") or vals.get("LETTA_SERVER_PASSWORD") or ""
