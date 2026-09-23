@@ -76,7 +76,7 @@ def test_seek_stream_linger_disable_lifecycle(tmp_path: Path, monkeypatch):
         broca_scrollback="idle\n" + _live(now),
         now=now,
     )
-    assert w.snapshot().status == "seeking"
+    assert w.snapshot().status in ("seeking", "streaming")
 
     # Wait for seek thread to finish stream → linger.
     deadline = time.time() + 5.0

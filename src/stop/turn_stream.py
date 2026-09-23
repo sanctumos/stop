@@ -393,7 +393,7 @@ def waiting_panel_text(*, agent_name: str, run_id: str = "", query: str = "") ->
     if run_id:
         wait = (
             f"Live on {run_id}…\n"
-            "(step stream — waiting for first model step)"
+            "(Letta is thinking — SSE stays quiet until a step lands)"
         )
     else:
         wait = f"Turn started — waiting for Letta run ({agent_name})…"
@@ -513,18 +513,90 @@ def run_still_in_flight(status: str) -> bool:
 
 
 def fetch_run_messages(creds: LettaAgentCreds, run_id: str) -> list[dict]:
-    """GET /v1/runs/{id}/messages — fallback when SSE yields nothing."""
+    """GET /v1/runs/{id}/messages — fallback when SSE yields nothing.
+
+    While a Venice/minimax step is still generating, Letta often returns an
+    empty list here even though the run is live. After each step completes,
+    ``/v1/steps/{step_id}/messages`` is populated first — use that as a
+    fallback so the popup is not blank until the whole run finishes.
+    """
     url = f"{creds.endpoint}/v1/runs/{run_id}/messages?limit=100&order=asc"
     try:
         data = _http_json("GET", url, api_key=creds.api_key, timeout=12.0)
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError):
-        return []
+    except (
+        urllib.error.URLError,
+        urllib.error.HTTPError,
+        TimeoutError,
+        json.JSONDecodeError,
+        OSError,
+        HttpPolicyError,
+    ):
+        data = None
+    rows: list[dict] = []
     if isinstance(data, list):
-        return [x for x in data if isinstance(x, dict)]
-    if isinstance(data, dict):
-        rows = data.get("messages") or data.get("data") or []
-        return [x for x in rows if isinstance(x, dict)]
-    return []
+        rows = [x for x in data if isinstance(x, dict)]
+    elif isinstance(data, dict):
+        raw = data.get("messages") or data.get("data") or []
+        rows = [x for x in raw if isinstance(x, dict)]
+    if rows:
+        return rows
+    return _fetch_messages_via_steps(creds, run_id)
+
+
+def _fetch_messages_via_steps(
+    creds: LettaAgentCreds, run_id: str
+) -> list[dict]:
+    """Assemble messages from completed steps when the run messages list is empty."""
+    url = f"{creds.endpoint}/v1/runs/{run_id}/steps"
+    try:
+        steps = _http_json("GET", url, api_key=creds.api_key, timeout=12.0)
+    except (
+        urllib.error.URLError,
+        urllib.error.HTTPError,
+        TimeoutError,
+        json.JSONDecodeError,
+        OSError,
+        HttpPolicyError,
+    ):
+        return []
+    if not isinstance(steps, list):
+        return []
+    out: list[dict] = []
+    seen: set[str] = set()
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        sid = step.get("id") or ""
+        if not sid:
+            continue
+        try:
+            data = _http_json(
+                "GET",
+                f"{creds.endpoint}/v1/steps/{sid}/messages",
+                api_key=creds.api_key,
+                timeout=10.0,
+            )
+        except (
+            urllib.error.URLError,
+            urllib.error.HTTPError,
+            TimeoutError,
+            json.JSONDecodeError,
+            OSError,
+            HttpPolicyError,
+        ):
+            continue
+        rows = data if isinstance(data, list) else []
+        if isinstance(data, dict):
+            rows = data.get("messages") or data.get("data") or []
+        for obj in rows:
+            if not isinstance(obj, dict):
+                continue
+            key = message_identity(obj)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(obj)
+    return out
 
 
 def messages_to_text(rows: list[dict]) -> str:
@@ -852,6 +924,7 @@ class TurnStreamWorker:
         self._active_response = None
         self._aux_threads: list[threading.Thread] = []
         self._shutting_down = False
+        self._armed_queue_id: object | None = None
 
     def _register_aux(self, thread: threading.Thread) -> None:
         with self._lock:
@@ -932,6 +1005,7 @@ class TurnStreamWorker:
                 self._seek_agent = None
                 self._pending_agents = []
                 self._followup_agent = None
+                self._armed_queue_id = None
             else:
                 self._stop_event.clear()
                 self.state.enabled = True
@@ -1122,11 +1196,15 @@ class TurnStreamWorker:
 
         if busy:
             # Queue background starts; never interrupt an in-flight focused turn.
+            # Do NOT arm follow-up from hardcopy LIVE edges while seeking/
+            # streaming — unstable hardcopy was wiping the finished answer
+            # with a queryless re-seek the instant stream_end fired
+            # (Athena 2026-09-23). Real next turns land via linger→LIVE or
+            # the idle Broca probe.
             changed = False
             with self._lock:
                 for name in started:
                     if name == selected_agent:
-                        self._followup_agent = name
                         continue
                     if name not in self._pending_agents:
                         self._pending_agents.append(name)
@@ -1361,6 +1439,11 @@ class TurnStreamWorker:
 
         def runner() -> None:
             try:
+                turn0 = fetch_broca_current_turn(
+                    self.agents_root, creds.agent_name
+                )
+                with self._lock:
+                    self._armed_queue_id = turn0.get("queue_id")
                 resolved = clean_user_query(recovery_query) or broca_q
                 if not resolved:
                     query = fetch_broca_triggering_message(
@@ -1781,9 +1864,15 @@ class TurnStreamWorker:
                     HttpPolicyError,
                 ) as exc:
                     stream_error = str(exc)[:200]
+                    err_l = stream_error.lower()
+                    soft = (
+                        "timed out" in err_l
+                        or "timeout" in err_l
+                        or isinstance(exc, TimeoutError)
+                    )
                     trace(
                         "turn",
-                        "stream_error",
+                        "stream_idle" if soft else "stream_error",
                         agent=creds.agent_name,
                         run=(run_id or "")[-12:],
                         error=type(exc).__name__,
@@ -1791,12 +1880,6 @@ class TurnStreamWorker:
                     )
                     if self._stop_event.is_set() or not self._gen_ok(gen):
                         break
-                    err_l = stream_error.lower()
-                    soft = (
-                        "timed out" in err_l
-                        or "timeout" in err_l
-                        or isinstance(exc, TimeoutError)
-                    )
                     status = fetch_run_status(creds, run_id)
                     # Idle SSE timeouts during thinking are soft. Once the
                     # run is finished, stop reconnecting — otherwise the
@@ -1914,18 +1997,55 @@ class TurnStreamWorker:
                 follow = self._followup_agent
                 self._followup_agent = None
         if follow and self._gen_ok(gen):
+            # Only honor an armed follow-up when Broca still has a *new*
+            # active turn (different queue id / different query). Same-turn
+            # LIVE hardcopy noise must not clear the linger panel.
+            turn = fetch_broca_current_turn(self.agents_root, creds.agent_name)
+            new_q = clean_user_query(str(turn.get("message") or ""))
             with self._lock:
-                if gen == self._generation and self.state.enabled:
-                    self.state.active = False
-                    self.state.lingering = False
-                    self.state.status = "idle"
-                    self.state.text = ""
-                    self.state.query = ""
-                    self.state.saw_waiting_query = False
-                    self.state.error = ""
-                    self.state.run_id = ""
-            self._start_seek(creds, since=time.time())
-            return
+                old_q = normalized_query(self.state.query)
+            new_qid = turn.get("queue_id")
+            armed_qid = None
+            with self._lock:
+                armed_qid = getattr(self, "_armed_queue_id", None)
+            same = (
+                not turn.get("active")
+                or (
+                    new_qid is not None
+                    and armed_qid is not None
+                    and new_qid == armed_qid
+                )
+                or (
+                    new_q
+                    and old_q
+                    and normalized_query(new_q) == old_q
+                )
+            )
+            if not same and new_q:
+                with self._lock:
+                    if gen == self._generation and self.state.enabled:
+                        self.state.active = False
+                        self.state.lingering = False
+                        self.state.status = "idle"
+                        self.state.text = ""
+                        self.state.query = ""
+                        self.state.saw_waiting_query = False
+                        self.state.error = ""
+                        self.state.run_id = ""
+                self._start_seek(
+                    creds,
+                    since=time.time(),
+                    initial_query=new_q,
+                    recovery_query=new_q,
+                )
+                return
+            trace(
+                "turn",
+                "followup_skip",
+                agent=creds.agent_name,
+                reason="same_turn_or_idle",
+                broca_active=bool(turn.get("active")),
+            )
 
         # A completed run's messages endpoint is authoritative. The previous
         # length-based merge could retain a longer reasoning trace and discard

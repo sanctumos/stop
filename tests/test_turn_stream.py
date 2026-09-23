@@ -780,7 +780,7 @@ def test_clean_and_extract_user_query():
     assert q == "ping please"
     wait = waiting_panel_text(agent_name="athena", run_id="run-abc", query=q)
     assert wait.startswith("> ping please")
-    assert "waiting for first model step" in wait
+    assert "Letta is thinking" in wait or "waiting for first model step" in wait
     body = with_query_header("[think] hmm\nOK", q)
     assert body.startswith("> ping please\n\n[think]")
 
