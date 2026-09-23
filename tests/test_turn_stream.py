@@ -442,7 +442,19 @@ def test_seek_deadline_follows_an_open_broca_turn():
         max_s=300,
     )
     assert capped == since + 300
-    # Idle Broca: leave the short deadline alone.
+    # Idle Broca but we already have the query from the log edge.
+    assert (
+        extend_seek_deadline(
+            since=since,
+            now=since + 50,
+            deadline=since + 45,
+            broca_active=False,
+            max_s=300,
+            have_query=True,
+        )
+        == since + 53
+    )
+    # Idle Broca and no query: leave the short deadline alone.
     assert (
         extend_seek_deadline(
             since=since,
@@ -844,6 +856,63 @@ def test_consume_stream_eof_while_running_keeps_going_then_merges_final(
     assert final in snap.text
     assert snap.text.startswith("> hi\n\n")
     assert "— turn complete —" in snap.text
+
+
+def test_consume_stream_idle_timeout_exits_when_run_already_done(
+    tmp_path: Path, monkeypatch
+):
+    """SSE read timeout after the run finished must not soft-loop forever."""
+    from stop.turn_stream import LettaAgentCreds, TurnStreamWorker
+
+    creds = LettaAgentCreds("athena", "agent-x", "k", "http://127.0.0.1:9")
+    w = TurnStreamWorker(agents_root=tmp_path)
+    w.STREAM_WALL_S = 30.0
+    w.SSE_READ_TIMEOUT_S = 1.0
+    w.LINGER_S = 30.0
+    monkeypatch.setattr(
+        "stop.turn_stream.fetch_run_status", lambda *a, **k: "completed"
+    )
+    monkeypatch.setattr(
+        "stop.turn_stream.fetch_run_messages",
+        lambda *a, **k: [
+            {"id": "a1", "message_type": "assistant_message", "content": "DONE"}
+        ],
+    )
+
+    class FakeResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def readline(self):
+            raise TimeoutError("timed out")
+
+    opens = {"n": 0}
+
+    def fake_open(*a, **k):
+        opens["n"] += 1
+        if opens["n"] > 2:
+            raise AssertionError("soft-loop reconnect after completed run")
+        return FakeResp()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_open)
+    with w._lock:
+        w.state.enabled = True
+        w.state.active = True
+        w.state.agent_name = "athena"
+        w.state.query = "hi"
+        w.state.text = "Turn started — waiting for Letta run (athena)…"
+        w.state.status = "streaming"
+        w._generation = 1
+    t0 = time.time()
+    w._consume_stream(creds, "run-1", gen=1)
+    assert time.time() - t0 < 5.0
+    assert opens["n"] == 1
+    snap = w.snapshot()
+    assert snap.status == "linger"
+    assert "DONE" in snap.text
 
 
 def test_show_turn_stays_visible_when_active_even_if_text_empty():

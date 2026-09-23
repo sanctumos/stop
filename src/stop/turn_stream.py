@@ -617,14 +617,19 @@ def extend_seek_deadline(
     deadline: float,
     broca_active: bool,
     max_s: float,
+    have_query: bool = False,
 ) -> float:
     """Keep seeking while Broca still owns the turn, up to ``max_s``.
 
     A flat 45s seek expires while Letta is still inside the blocking
     messages POST (these turns run 50–240s). If the run row is not
     listable until that POST returns, the popup times out on the query.
+
+    When the log edge already gave us the Broca text, keep looking even
+    if ``/v1/turn/current`` has flipped idle — that probe can lag or go
+    idle between dequeue and the Letta POST.
     """
-    if not broca_active:
+    if not broca_active and not have_query:
         return deadline
     return min(since + max_s, max(deadline, now + 3.0))
 
@@ -1224,6 +1229,7 @@ class TurnStreamWorker:
                 deadline=deadline,
                 broca_active=bool(turn.get("active")),
                 max_s=self.SEEK_MAX_S,
+                have_query=bool(normalized_query(recovery_query)),
             )
             if new_deadline != deadline:
                 trace(
@@ -1536,8 +1542,31 @@ class TurnStreamWorker:
                         or isinstance(exc, TimeoutError)
                     )
                     status = fetch_run_status(creds, run_id)
-                    if soft or run_still_in_flight(status):
-                        # Thinking gap or transient socket — stay on overlay.
+                    # Idle SSE timeouts during thinking are soft. Once the
+                    # run is finished, stop reconnecting — otherwise the
+                    # overlay never reaches stream_end / linger and the next
+                    # turn has to fight a stuck worker (Athena 2026-09-23).
+                    if soft and run_still_in_flight(status):
+                        with self._lock:
+                            if gen == self._generation and self.state.enabled:
+                                self.state.status = "streaming"
+                                if _is_placeholder(self.state.text) or not (
+                                    self.state.text or ""
+                                ).strip():
+                                    self.state.text = waiting_panel_text(
+                                        agent_name=creds.agent_name,
+                                        run_id=run_id,
+                                        query=self.state.query,
+                                    )
+                        self._notify()
+                        stream_error = ""
+                        time.sleep(0.3)
+                        continue
+                    if soft and not run_still_in_flight(status):
+                        stream_error = ""
+                        stream_done = True
+                        break
+                    if run_still_in_flight(status):
                         with self._lock:
                             if gen == self._generation and self.state.enabled:
                                 self.state.status = "streaming"
