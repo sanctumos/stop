@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import time
 from abc import ABC, abstractmethod
@@ -28,6 +29,19 @@ from .state import is_failure
 
 # Keep memory bounded — full Letta/Broca hardcopies can be 100KB–MB each.
 SCROLLBACK_MAX_BYTES = 32_768
+# Screen session names used in hardcopy paths — reject path escapes.
+_SAFE_SCREEN_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def sanitize_screen_name(screen_name: str) -> str | None:
+    """Return ``screen_name`` if safe for hardcopy filenames, else None."""
+    name = (screen_name or "").strip()
+    if not name or name in (".", "..") or "/" in name or "\\" in name:
+        return None
+    if not _SAFE_SCREEN_NAME.match(name):
+        return None
+    return name
+
 SCROLLBACK_MAX_LINES = 120
 HARDCOPY_TIMEOUT_S = 1.5
 
@@ -554,13 +568,16 @@ class LiveHost(HostBackend):
         """
         if screen_name in NEVER_HARDCOPY:
             return ""
+        safe = sanitize_screen_name(screen_name)
+        if safe is None:
+            return ""
         cached = self._scroll_cache.get(screen_name)
         cached_text = cached[1] if cached else ""
-        out = self.tmp / f"{screen_name}.{time.time_ns()}.hc"
+        out = self.tmp / f"{safe}.{time.time_ns()}.hc"
         t0 = time.perf_counter()
         try:
             subprocess.run(
-                ["screen", "-S", screen_name, "-X", "hardcopy", "-h", str(out)],
+                ["screen", "-S", safe, "-X", "hardcopy", "-h", str(out)],
                 capture_output=True,
                 text=True,
                 timeout=HARDCOPY_TIMEOUT_S,

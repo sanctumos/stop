@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sanctum-stop"
-version = "0.0.1"
+version = "0.1.0"
 description = "stop — SanctumOS-top. A btop-shaped, read-only procman TUI for Sanctum agents running in GNU screen."
 readme = "README.md"
 requires-python = ">=3.12"

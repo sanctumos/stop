@@ -46,6 +46,27 @@ Owns: layout, CSS, `RichLog` / `Static` updates, keybindings, screenshots.
 Lightweight counters under `/tmp/stop-<uid>/metrics.jsonl` (no secrets, no
 message bodies). See `stop.metrics`.
 
+## Turn popup state machine
+
+Statuses on `TurnStreamState.status` (and `enabled` / `follow_all`):
+
+| From | Event | To | Notes |
+|------|-------|-----|-------|
+| off | `t` / `f` on | idle | `follow_all` true only for `f` |
+| idle | Broca LIVE edge / probe | seeking | selected mode: focused agent only |
+| seeking | run found | streaming | SSE + message poller |
+| seeking | timeout / no creds | error → linger | short linger |
+| streaming | run complete | linger | 60s default |
+| linger | timer | idle | cooldown before re-arm |
+| any busy | newer start + follow | seeking (other) | preempt closes SSE |
+| any | disable / quit | off | closes socket; joins workers |
+
+`pending_agents` is a badge queue in selected mode (background starts while busy).
+Drain: cleared on disable; capped display of first three in chrome. Follow mode
+preempts instead of queueing.
+
+See Tasks #4448.
+
 ## Related Tasks
 
-Parent epic #4041 · rebuild slices #4060–#4074.
+Parent epic #4041 · rebuild slices #4060–#4074 · customer hardening #4444–#4458.

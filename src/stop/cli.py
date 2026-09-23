@@ -42,6 +42,16 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="Also append --watch lines to PATH (for smoke proof).",
     )
+    p.add_argument(
+        "--agents-root",
+        metavar="DIR",
+        help="Agents tree (default: ~/sanctum/agents or STOP_AGENTS_ROOT / config).",
+    )
+    p.add_argument(
+        "--logs-root",
+        metavar="DIR",
+        help="Logs tree (default: ~/logs or STOP_LOGS_ROOT / config).",
+    )
     p.add_argument("--version", action="version", version=f"stop {__version__}")
     return p
 
@@ -75,9 +85,21 @@ def main(argv: list[str] | None = None) -> int:
     if args.once or args.watch is not None:
         from pathlib import Path
 
+        from .config import load_config
         from .host import FixtureHost, LiveHost
 
-        host = FixtureHost(Path(args.fixture)) if args.fixture else LiveHost()
+        cfg = load_config(Path(args.config) if args.config else None)
+        if getattr(args, "agents_root", None):
+            cfg.agents_root = args.agents_root
+        if getattr(args, "logs_root", None):
+            cfg.logs_root = args.logs_root
+        if args.fixture:
+            host = FixtureHost(Path(args.fixture))
+        else:
+            host = LiveHost(
+                agents_root=Path(cfg.agents_root) if cfg.agents_root else None,
+                logs_root=Path(cfg.logs_root) if cfg.logs_root else None,
+            )
         log_fp = open(args.watch_log, "a", encoding="utf-8") if args.watch_log else None
         try:
             if args.once and args.watch is None:
@@ -111,7 +133,12 @@ def main(argv: list[str] | None = None) -> int:
 
     from .app import run_app
 
-    run_app(fixture=args.fixture, config_path=args.config)
+    run_app(
+        fixture=args.fixture,
+        config_path=args.config,
+        agents_root=getattr(args, "agents_root", None),
+        logs_root=getattr(args, "logs_root", None),
+    )
     return 0
 
 

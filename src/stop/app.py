@@ -850,6 +850,10 @@ class StopApp(App[None]):
         self._apply_breakpoint()
 
     def on_unmount(self) -> None:
+        if self._turn is not None:
+            self._turn.shutdown(timeout=5.0)
+            self._turn = None
+        self._collector.on_update = None
         self._collector.stop(timeout=2.0)
 
     def on_resize(self, event) -> None:  # noqa: ANN001
@@ -1026,10 +1030,14 @@ class StopApp(App[None]):
                 f"[red]refresh error ({self._errors}): {_plain(str(exc)[:80])}[/red]"
             )
             try:
-                log = Path(f"/tmp/stop-{os.getuid()}") / "tui-errors.log"
-                log.parent.mkdir(mode=0o700, exist_ok=True)
-                with log.open("a", encoding="utf-8") as f:
-                    f.write(time.strftime("%Y-%m-%dT%H:%M:%S ") + traceback.format_exc() + "\n")
+                from .scratch import append_bounded, tui_errors_path
+
+                append_bounded(
+                    tui_errors_path(),
+                    time.strftime("%Y-%m-%dT%H:%M:%S ")
+                    + traceback.format_exc()
+                    + "\n",
+                )
             except OSError:
                 pass
 
@@ -1301,10 +1309,30 @@ class StopApp(App[None]):
         self.refresh_host()
 
 
-def run_app(*, fixture: str | None = None, config_path: str | None = None) -> None:
+def run_app(
+    *,
+    fixture: str | None = None,
+    config_path: str | None = None,
+    agents_root: str | None = None,
+    logs_root: str | None = None,
+) -> None:
     cfg = load_config(Path(config_path) if config_path else None)
+    if agents_root:
+        cfg.agents_root = agents_root
+    if logs_root:
+        cfg.logs_root = logs_root
     if fixture:
         host: HostBackend = FixtureHost(Path(fixture))
     else:
-        host = LiveHost()
+        host = LiveHost(
+            agents_root=Path(cfg.agents_root) if cfg.agents_root else None,
+            logs_root=Path(cfg.logs_root) if cfg.logs_root else None,
+        )
+    # Wire pluggable classifiers from config.
+    from . import activity as activity_mod
+
+    activity_mod.configure_classifiers(
+        noise_patterns=cfg.noise_patterns or None,
+        dialogue_patterns=cfg.dialogue_patterns or None,
+    )
     StopApp(host, config=cfg).run()

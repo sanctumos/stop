@@ -83,10 +83,11 @@ class HostCollector:
                 self._pending = False
                 self._busy = True
             try:
-                # Never mark LiveHost UI-thread for this worker.
-                if isinstance(self.host, LiveHost):
-                    self.host.ui_thread_ident = None
-                snap = self.host.snapshot()
+                # Collector thread is never the UI thread — leave ui_thread_ident alone
+                # so accidental LiveHost.snapshot() from Textual still increments the metric.
+                import copy
+
+                snap = copy.deepcopy(self.host.snapshot())
                 with self._lock:
                     self._latest = snap
                     self._revision += 1
@@ -94,8 +95,15 @@ class HostCollector:
                 if self.on_update:
                     try:
                         self.on_update()
-                    except Exception:
-                        pass
+                    except Exception as exc:  # noqa: BLE001
+                        from .telemetry import trace
+
+                        trace(
+                            "collector",
+                            "notify_error",
+                            error=type(exc).__name__,
+                            detail=str(exc)[:120],
+                        )
             except Exception as exc:  # noqa: BLE001
                 METRICS.note_refresh_error()
                 with self._lock:

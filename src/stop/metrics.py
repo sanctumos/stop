@@ -84,12 +84,13 @@ class StopMetrics:
             }
 
     def flush(self, *, path: Path | None = None) -> Path:
+        from .scratch import append_bounded
+
         d = metrics_dir()
         d.mkdir(mode=0o700, exist_ok=True)
         out = path or (d / "metrics.jsonl")
-        line = json.dumps(self.snapshot_dict(), separators=(",", ":"))
-        with out.open("a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        line = json.dumps(self.snapshot_dict(), separators=(",", ":")) + "\n"
+        append_bounded(out, line, max_bytes=256 * 1024)
         return out
 
 

@@ -43,10 +43,22 @@ _SECRET_KEY = re.compile(
     r"(api[_-]?key|token|password|secret|authorization|cookie)",
     re.I,
 )
+# Bearer tokens / long hex-ish secrets embedded in free text.
+_SECRET_VALUE = re.compile(
+    r"(?i)(?:bearer\s+[a-z0-9._\-/+=]{12,}"
+    r"|sk-[a-z0-9]{16,}"
+    r"|[a-f0-9]{32,}"
+    r"|[A-Za-z0-9_-]{40,})"
+)
 
 
 def trace_path(uid: int | None = None) -> Path:
     return metrics_dir(uid) / "trace.json"
+
+
+def _scrub_string(value: str) -> str:
+    s = value if len(value) <= FIELD_MAX else value[: FIELD_MAX - 1] + "…"
+    return _SECRET_VALUE.sub("[redacted]", s)
 
 
 def _redact(value: Any, *, depth: int = 0) -> Any:
@@ -55,7 +67,7 @@ def _redact(value: Any, *, depth: int = 0) -> Any:
     if value is None or isinstance(value, (int, float, bool)):
         return value
     if isinstance(value, str):
-        return value if len(value) <= FIELD_MAX else value[: FIELD_MAX - 1] + "…"
+        return _scrub_string(value)
     if isinstance(value, dict):
         out: dict[str, Any] = {}
         for key, item in list(value.items())[:24]:
@@ -66,7 +78,7 @@ def _redact(value: Any, *, depth: int = 0) -> Any:
         return out
     if isinstance(value, (list, tuple)):
         return [_redact(item, depth=depth + 1) for item in list(value)[:12]]
-    return str(value)[:FIELD_MAX]
+    return _scrub_string(str(value)[:FIELD_MAX])
 
 
 def _signature(component: str, event: str, detail: dict[str, Any]) -> str:

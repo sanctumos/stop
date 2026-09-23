@@ -943,12 +943,15 @@ def test_consume_stream_eof_while_running_keeps_going_then_merges_final(
         def __exit__(self, *a):
             return False
 
+        def close(self):
+            return None
+
         def readline(self):
             # Immediate EOF → old bug treated this as stream_done.
             return b""
 
     monkeypatch.setattr(
-        "urllib.request.urlopen",
+        "stop.turn_stream._safe_urlopen",
         lambda *a, **k: FakeResp(),
     )
 
@@ -1002,6 +1005,9 @@ def test_consume_stream_idle_timeout_exits_when_run_already_done(
         def __exit__(self, *a):
             return False
 
+        def close(self):
+            return None
+
         def readline(self):
             raise TimeoutError("timed out")
 
@@ -1013,7 +1019,7 @@ def test_consume_stream_idle_timeout_exits_when_run_already_done(
             raise AssertionError("soft-loop reconnect after completed run")
         return FakeResp()
 
-    monkeypatch.setattr("urllib.request.urlopen", fake_open)
+    monkeypatch.setattr("stop.turn_stream._safe_urlopen", fake_open)
     with w._lock:
         w.state.enabled = True
         w.state.active = True

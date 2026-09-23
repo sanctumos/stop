@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from .http_safe import HttpPolicyError, http_json as _safe_http_json, urlopen as _safe_urlopen
+from .http_safe import validate_outbound_url
 from .livelog import unwrap_screen_hardcopy
 from .telemetry import trace
 
@@ -183,25 +185,37 @@ def _parse_env_file(path: Path) -> dict[str, str]:
     return vals
 
 
+# Only these keys are read from agent env files (never the whole dump).
+_LETTA_ENV_KEYS = frozenset({"AGENT_ID", "AGENT_API_KEY", "AGENT_ENDPOINT"})
+
+
 def load_agent_creds(agents_root: Path, agent_name: str) -> LettaAgentCreds | None:
     """Read Letta creds from agents/<name>/.env and/or broca/.env.
 
     Athena-style agents put AGENT_ID in ``broca/.env``. Q / Porter / Wren keep
     Letta identity one level up and only Broca/Telegram keys under broca/.
     Merge parent first, then broca (broca wins on overlap) so both layouts work.
+
+    Does **not** fall back to ``LETTA_SERVER_PASSWORD`` — that is a host-wide
+    secret and must not become a per-agent API key on multi-agent installs.
     """
     root = agents_root / agent_name
-    vals = _parse_env_file(root / ".env")
-    vals.update(_parse_env_file(root / "broca" / ".env"))
-    if not vals:
+    raw = _parse_env_file(root / ".env")
+    raw.update(_parse_env_file(root / "broca" / ".env"))
+    if not raw:
         return None
+    vals = {k: raw[k] for k in _LETTA_ENV_KEYS if k in raw}
     agent_id = vals.get("AGENT_ID") or ""
-    api_key = vals.get("AGENT_API_KEY") or vals.get("LETTA_SERVER_PASSWORD") or ""
+    api_key = vals.get("AGENT_API_KEY") or ""
     endpoint = (vals.get("AGENT_ENDPOINT") or "http://127.0.0.1:8284").rstrip("/")
     # AGENT_ENDPOINT sometimes includes /v1 — normalize to server root.
     if endpoint.endswith("/v1"):
         endpoint = endpoint[:-3]
     if not agent_id or not api_key:
+        return None
+    try:
+        validate_outbound_url(endpoint)
+    except HttpPolicyError:
         return None
     return LettaAgentCreds(
         agent_name=agent_name,
@@ -267,6 +281,9 @@ def clean_user_query(content: str) -> str:
     return text.strip()
 
 
+_BROCA_ENV_KEYS = frozenset({"OTTO_BRIDGE_HTTP_LISTEN", "OTTO_BRIDGE_HTTP_API_KEY"})
+
+
 def broca_http_creds(agents_root: Path, agent_name: str) -> tuple[str, str] | None:
     """Return (base_url, api_key) for this agent's Otto bridge HTTP listener."""
     env_path = agents_root / agent_name / "broca" / ".env"
@@ -274,16 +291,8 @@ def broca_http_creds(agents_root: Path, agent_name: str) -> tuple[str, str] | No
         env_path = agents_root / agent_name / ".env"
     if not env_path.is_file():
         return None
-    vals: dict[str, str] = {}
-    try:
-        for line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
-            s = line.strip()
-            if not s or s.startswith("#") or "=" not in s:
-                continue
-            k, _, v = s.partition("=")
-            vals[k.strip()] = v.strip().strip("'").strip('"')
-    except OSError:
-        return None
+    raw = _parse_env_file(env_path)
+    vals = {k: raw[k] for k in _BROCA_ENV_KEYS if k in raw}
     listen = (vals.get("OTTO_BRIDGE_HTTP_LISTEN") or "").strip()
     key = (vals.get("OTTO_BRIDGE_HTTP_API_KEY") or "").strip()
     if not listen or not key:
@@ -294,6 +303,10 @@ def broca_http_creds(agents_root: Path, agent_name: str) -> tuple[str, str] | No
         host, _, port = listen.rpartition(":")
         host = host.strip() or "127.0.0.1"
         base = f"http://{host}:{port.strip()}"
+    try:
+        validate_outbound_url(base)
+    except HttpPolicyError:
+        return None
     return base, key
 
 
@@ -319,7 +332,7 @@ def fetch_broca_current_turn(
         method="GET",
     )
     try:
-        with urllib.request.urlopen(req, timeout=3.0) as resp:
+        with _safe_urlopen(req, timeout=3.0) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
         data = json.loads(raw) if raw.strip() else {}
     except (
@@ -328,6 +341,7 @@ def fetch_broca_current_turn(
         TimeoutError,
         json.JSONDecodeError,
         OSError,
+        HttpPolicyError,
     ):
         return {"active": False, "message": "", "status": "unavailable"}
     if not isinstance(data, dict):
@@ -427,20 +441,9 @@ def _http_json(
     body: dict | None = None,
     timeout: float = 10.0,
 ) -> object:
-    data = None
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Accept": "application/json",
-    }
-    if body is not None:
-        data = json.dumps(body).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read().decode("utf-8", errors="replace")
-    if not raw.strip():
-        return None
-    return json.loads(raw)
+    return _safe_http_json(
+        method, url, api_key=api_key, body=body, timeout=timeout
+    )
 
 
 def list_runs_for_agent(
@@ -816,7 +819,10 @@ class TurnStreamWorker:
     # Hard wall for one turn (seek+stream). Prevents forever-open SSE loops.
     STREAM_WALL_S = 900.0
     SEEN_RUNS_MAX = 100
-    DISABLE_JOIN_S = 2.0
+    # Must exceed SSE_READ_TIMEOUT_S once the socket is closed on disable;
+    # close-on-disable unblocks readline so joins finish well under this.
+    DISABLE_JOIN_S = 5.0
+    SHUTDOWN_JOIN_S = 5.0
 
     def __init__(
         self,
@@ -843,13 +849,69 @@ class TurnStreamWorker:
         self._probe_thread: threading.Thread | None = None
         self._probe_after = 0.0
         self._seen_bridge_turns: set[tuple[str, object]] = set()
+        self._active_response = None
+        self._aux_threads: list[threading.Thread] = []
+        self._shutting_down = False
+
+    def _register_aux(self, thread: threading.Thread) -> None:
+        with self._lock:
+            self._aux_threads = [t for t in self._aux_threads if t.is_alive()]
+            self._aux_threads.append(thread)
+
+    def _close_active_stream(self) -> None:
+        resp = None
+        with self._lock:
+            resp = self._active_response
+            self._active_response = None
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+    def _set_active_response(self, resp) -> None:  # noqa: ANN001
+        with self._lock:
+            self._active_response = resp
+
+    def _join_workers(self, *, timeout: float) -> None:
+        deadline = time.time() + timeout
+        threads: list[threading.Thread] = []
+        with self._lock:
+            if self._thread is not None:
+                threads.append(self._thread)
+            if self._probe_thread is not None:
+                threads.append(self._probe_thread)
+            threads.extend(self._aux_threads)
+        for t in threads:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            if t.is_alive():
+                t.join(timeout=remaining)
+
+    def shutdown(self, *, timeout: float | None = None) -> None:
+        """Hard stop for TUI quit — clear callbacks, cancel streams, join threads."""
+        budget = self.SHUTDOWN_JOIN_S if timeout is None else timeout
+        self.on_update = None
+        with self._lock:
+            self._shutting_down = True
+        self.set_enabled(False)
+        self._close_active_stream()
+        self._join_workers(timeout=budget)
+        with self._lock:
+            self._thread = None
+            self._probe_thread = None
+            self._aux_threads = []
 
     def _gen_ok(self, gen: int) -> bool:
         with self._lock:
-            return self.state.enabled and gen == self._generation
+            return (
+                self.state.enabled
+                and not self._shutting_down
+                and gen == self._generation
+            )
 
     def set_enabled(self, enabled: bool) -> None:
-        thread: threading.Thread | None = None
         with self._lock:
             was = self.state.enabled
             # Always bump generation so in-flight workers go stale.
@@ -870,10 +932,10 @@ class TurnStreamWorker:
                 self._seek_agent = None
                 self._pending_agents = []
                 self._followup_agent = None
-                thread = self._thread
             else:
                 self._stop_event.clear()
                 self.state.enabled = True
+                self._shutting_down = False
                 if not was:
                     self.state.follow_all = False
                     self.state.active = False
@@ -888,8 +950,9 @@ class TurnStreamWorker:
                     self._seek_agent = None
                     self._pending_agents = []
                     self._followup_agent = None
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=self.DISABLE_JOIN_S)
+        if not enabled:
+            self._close_active_stream()
+            self._join_workers(timeout=self.DISABLE_JOIN_S)
 
     def set_mode(self, mode: str) -> None:
         """``off`` | ``selected`` | ``follow``. ``t`` and ``f`` map here."""
@@ -967,7 +1030,6 @@ class TurnStreamWorker:
         preempts the current stream.
         """
         now = now or time.time()
-        self._selected_agent = selected_agent
         by_agent: dict[str, str] = {}
         if broca_by_agent:
             by_agent.update(broca_by_agent)
@@ -975,12 +1037,14 @@ class TurnStreamWorker:
             by_agent[selected_agent] = broca_scrollback or ""
 
         with self._lock:
+            self._selected_agent = selected_agent
             enabled = self.state.enabled
             follow_all = self.state.follow_all
             lingering = self.state.lingering
             linger_until = self.state.linger_until
             status = self.state.status
             current_agent = self.state.agent_name
+            thread_alive = bool(self._thread and self._thread.is_alive())
 
         if not enabled:
             return
@@ -995,39 +1059,40 @@ class TurnStreamWorker:
                 self.state.saw_waiting_query = False
                 self.state.run_id = ""
                 self.state.agent_name = ""
-            if selected_agent:
-                self._cooldown_until[selected_agent] = (
-                    now + self.RETRIGGER_COOLDOWN_S
-                )
-            for name, text in by_agent.items():
-                if (text or "").strip():
-                    self._prev_scroll[name] = text
+                if selected_agent:
+                    self._cooldown_until[selected_agent] = (
+                        now + self.RETRIGGER_COOLDOWN_S
+                    )
+                for name, text in by_agent.items():
+                    if (text or "").strip():
+                        self._prev_scroll[name] = text
             self._notify()
             return
 
         busy = (
             lingering
             or status in ("streaming", "seeking", "linger", "error")
-            or (self._thread and self._thread.is_alive())
+            or thread_alive
         )
 
-        # Advance cursors / detect starts for every agent independently.
+        # Advance cursors / detect starts under the same lock as cooldowns.
         started: list[str] = []
-        for name, new in sorted(by_agent.items()):
-            if not (new or "").strip():
-                continue
-            if now < self._cooldown_until.get(name, 0.0):
+        with self._lock:
+            for name, new in sorted(by_agent.items()):
+                if not (new or "").strip():
+                    continue
+                if now < self._cooldown_until.get(name, 0.0):
+                    self._prev_scroll[name] = new
+                    continue
+                prev = self._prev_scroll.get(name)
+                if prev is None:
+                    self._prev_scroll[name] = new
+                    if scrollback_signals_turn_start("", new, now=now):
+                        started.append(name)
+                    continue
                 self._prev_scroll[name] = new
-                continue
-            prev = self._prev_scroll.get(name)
-            if prev is None:
-                self._prev_scroll[name] = new
-                if scrollback_signals_turn_start("", new, now=now):
+                if scrollback_signals_turn_start(prev, new, now=now):
                     started.append(name)
-                continue
-            self._prev_scroll[name] = new
-            if scrollback_signals_turn_start(prev, new, now=now):
-                started.append(name)
 
         if follow_all:
             self._tick_follow(
@@ -1058,31 +1123,36 @@ class TurnStreamWorker:
         if busy:
             # Queue background starts; never interrupt an in-flight focused turn.
             changed = False
-            for name in started:
-                if name == selected_agent:
-                    self._followup_agent = name
-                    continue
-                if name not in self._pending_agents:
-                    self._pending_agents.append(name)
-                    changed = True
-            if changed:
-                with self._lock:
+            with self._lock:
+                for name in started:
+                    if name == selected_agent:
+                        self._followup_agent = name
+                        continue
+                    if name not in self._pending_agents:
+                        self._pending_agents.append(name)
+                        changed = True
+                if changed:
                     self.state.pending_agents = list(self._pending_agents)
+            if changed:
                 self._notify()
             return
 
         if not selected_agent:
             # Still record pending badges when nothing is selected.
-            for name in started:
-                if name not in self._pending_agents:
-                    self._pending_agents.append(name)
+            with self._lock:
+                for name in started:
+                    if name not in self._pending_agents:
+                        self._pending_agents.append(name)
+                        self.state.pending_agents = list(self._pending_agents)
             return
 
         # Prefer selected agent's start; else leave others as pending.
         if selected_agent in started:
-            for name in started:
-                if name != selected_agent and name not in self._pending_agents:
-                    self._pending_agents.append(name)
+            with self._lock:
+                for name in started:
+                    if name != selected_agent and name not in self._pending_agents:
+                        self._pending_agents.append(name)
+                pending = list(self._pending_agents)
             creds = load_agent_creds(self.agents_root, selected_agent)
             if creds is None:
                 with self._lock:
@@ -1092,7 +1162,7 @@ class TurnStreamWorker:
                     self.state.agent_name = selected_agent
                     self.state.linger_until = now + 8.0
                     self.state.lingering = True
-                    self.state.pending_agents = list(self._pending_agents)
+                    self.state.pending_agents = pending
                 self._notify()
                 return
             self._start_seek(creds, since=now)
@@ -1102,12 +1172,16 @@ class TurnStreamWorker:
         # LIVE log edge. The HTTP probe runs off the UI thread.
         self._probe_current_turn(selected_agent, now=now)
 
-        for name in started:
-            if name not in self._pending_agents:
-                self._pending_agents.append(name)
-                with self._lock:
-                    self.state.pending_agents = list(self._pending_agents)
-                self._notify()
+        with self._lock:
+            changed = False
+            for name in started:
+                if name not in self._pending_agents:
+                    self._pending_agents.append(name)
+                    changed = True
+            if changed:
+                self.state.pending_agents = list(self._pending_agents)
+        if changed:
+            self._notify()
 
     def _tick_follow(
         self,
@@ -1192,6 +1266,7 @@ class TurnStreamWorker:
             self.state.pending_agents = []
             self._pending_agents = []
             thread = self._thread
+        self._close_active_stream()
         if thread is not None and thread.is_alive():
             thread.join(timeout=0.8)
         self._stop_event.clear()
@@ -1308,6 +1383,13 @@ class TurnStreamWorker:
             except Exception as exc:  # noqa: BLE001
                 if not self._gen_ok(gen):
                     return
+                trace(
+                    "turn",
+                    "seek_error",
+                    agent=creds.agent_name,
+                    error=type(exc).__name__,
+                    detail=str(exc)[:160],
+                )
                 with self._lock:
                     if gen != self._generation or not self.state.enabled:
                         return
@@ -1575,8 +1657,28 @@ class TurnStreamWorker:
                             _apply_text(msg_text)
                     elif msg_text:
                         _apply_text(msg_text)
-                except Exception:
-                    pass
+                except (
+                    urllib.error.URLError,
+                    urllib.error.HTTPError,
+                    TimeoutError,
+                    OSError,
+                    json.JSONDecodeError,
+                    HttpPolicyError,
+                ) as exc:
+                    trace(
+                        "turn",
+                        "poll_error",
+                        agent=creds.agent_name,
+                        run=(run_id or "")[-12:],
+                        error=type(exc).__name__,
+                        detail=str(exc)[:160],
+                    )
+                    with self._lock:
+                        if gen == self._generation and self.state.enabled:
+                            # Sticky surface for control-plane poll failures.
+                            if not self.state.error:
+                                self.state.error = f"message poll: {type(exc).__name__}"
+                    self._notify()
                 # Faster while still waiting so the query header lands before
                 # the first step when Letta is slow to emit chunks.
                 with self._lock:
@@ -1586,6 +1688,7 @@ class TurnStreamWorker:
         poller = threading.Thread(
             target=_poll_messages, name=f"turn-poll-{run_id[-8:]}", daemon=True
         )
+        self._register_aux(poller)
         poller.start()
         stream_done = False
         wall_deadline = time.time() + self.STREAM_WALL_S
@@ -1601,9 +1704,9 @@ class TurnStreamWorker:
                     stream_error = stream_error or "stream wall clock exceeded"
                     break
                 try:
-                    with urllib.request.urlopen(
-                        req, timeout=self.SSE_READ_TIMEOUT_S
-                    ) as resp:
+                    resp = _safe_urlopen(req, timeout=self.SSE_READ_TIMEOUT_S)
+                    self._set_active_response(resp)
+                    try:
                         while not self._stop_event.is_set() and self._gen_ok(gen):
                             if time.time() >= wall_deadline:
                                 stream_error = stream_error or (
@@ -1668,11 +1771,14 @@ class TurnStreamWorker:
                                 else:
                                     buf_lines.append(piece)
                             _apply_text("\n".join(buf_lines))
+                    finally:
+                        self._close_active_stream()
                 except (
                     urllib.error.URLError,
                     urllib.error.HTTPError,
                     TimeoutError,
                     OSError,
+                    HttpPolicyError,
                 ) as exc:
                     stream_error = str(exc)[:200]
                     trace(
@@ -1870,8 +1976,9 @@ class TurnStreamWorker:
         self._notify()
 
     def _notify(self) -> None:
-        if self.on_update:
-            try:
-                self.on_update()
-            except Exception:
-                pass
+        if self._shutting_down or not self.on_update:
+            return
+        try:
+            self.on_update()
+        except Exception as exc:  # noqa: BLE001 — UI may already be gone
+            trace("turn", "notify_error", error=type(exc).__name__, detail=str(exc)[:120])

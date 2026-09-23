@@ -58,15 +58,32 @@ _LOG_TIMESTAMP_RE = re.compile(
     r"^\[(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})\]"
 )
 
+# Runtime extras from config (customer Broca dialects).
+_extra_noise: list[re.Pattern[str]] = []
+_extra_dialogue: list[re.Pattern[str]] = []
+
+
+def configure_classifiers(
+    *,
+    noise_patterns: list[str] | None = None,
+    dialogue_patterns: list[str] | None = None,
+) -> None:
+    """Teach stop additional noise/dialogue regexes without a code fork."""
+    global _extra_noise, _extra_dialogue
+    _extra_noise = [re.compile(p, re.I) for p in (noise_patterns or [])]
+    _extra_dialogue = [re.compile(p, re.I) for p in (dialogue_patterns or [])]
+
 
 def classify_line(line: str) -> int:
     """Return KIND_* for one log line."""
     s = line.strip()
     if not s:
         return KIND_NOISE
-    if any(r.search(s) for r in _NOISE_RES):
+    if any(r.search(s) for r in _NOISE_RES) or any(r.search(s) for r in _extra_noise):
         return KIND_NOISE
-    if any(r.search(s) for r in _DIALOGUE_RES):
+    if any(r.search(s) for r in _DIALOGUE_RES) or any(
+        r.search(s) for r in _extra_dialogue
+    ):
         return KIND_DIALOGUE
     return KIND_OTHER
 

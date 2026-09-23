@@ -1,20 +1,26 @@
 #!/usr/bin/env bash
 # Idempotent stop launcher. Keeps exactly one live `stop` screen.
 #
-# Same shape as the Broca starters on moya: cron calls this every minute
-# and at boot. A live session is left alone (attached or not). A dead
-# socket is wiped. The shell stays under the TUI so tools/reload-in-screen.sh
-# can stuff `q` and start stop again without destroying the screen.
+# Same shape as the Broca starters: cron calls this every minute and at boot.
+# A live session is left alone (attached or not). A dead socket is wiped.
+# The shell stays under the TUI so tools/reload-in-screen.sh can stuff `q`
+# and start stop again without destroying the screen.
 #
-# Cron (rizzn on moya):
-#   @reboot /home/rizzn/sanctum/repos/stop/tools/start-in-screen.sh >> /home/rizzn/logs/stop-cron.log 2>&1
-#   * * * * * /home/rizzn/sanctum/repos/stop/tools/start-in-screen.sh >> /home/rizzn/logs/stop-cron.log 2>&1
+# Customer install: set STOP_REPO to your checkout. Optional STOP_SCREEN_NAME,
+# STOP_START_LOCK (defaults to /tmp/stop-<uid>-screen-start.lock).
+#
+# Example cron (replace the log path as needed):
+#   @reboot /path/to/stop/tools/start-in-screen.sh >>"$HOME/logs/stop-cron.log" 2>&1
+#   * * * * * /path/to/stop/tools/start-in-screen.sh >>"$HOME/logs/stop-cron.log" 2>&1
 
 set -euo pipefail
 
 SESSION_NAME="${STOP_SCREEN_NAME:-stop}"
-STOP_REPO="${STOP_REPO:-/home/rizzn/sanctum/repos/stop}"
-LOCK_FILE="${STOP_START_LOCK:-/tmp/stop-screen-start.lock}"
+if [[ -z "${STOP_REPO:-}" ]]; then
+  # Prefer the directory that contains this script (portable checkout).
+  STOP_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+fi
+LOCK_FILE="${STOP_START_LOCK:-/tmp/stop-$(id -u)-screen-start.lock}"
 
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
