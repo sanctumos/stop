@@ -393,7 +393,7 @@ def waiting_panel_text(*, agent_name: str, run_id: str = "", query: str = "") ->
     if run_id:
         wait = (
             f"Live on {run_id}…\n"
-            "(Letta is thinking — SSE stays quiet until a step lands)"
+            f"({agent_name} is thinking — SSE stays quiet until a step lands)"
         )
     else:
         wait = f"Turn started — waiting for Letta run ({agent_name})…"
