@@ -180,9 +180,9 @@ def test_follow_lock_and_help_filter_tiny_height():
             await pilot.pause(0.05)
             await pilot.press("escape")
             await pilot.pause(0.05)
-            await pilot.press("f")
+            await pilot.press("p")
             await pilot.pause(0.05)
-            # follow lock toggles without crashing on tiny height
+            # Active Now pin toggles without crashing on tiny height
             app.refresh_host()
             await pilot.pause(0.05)
 

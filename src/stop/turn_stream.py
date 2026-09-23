@@ -147,11 +147,15 @@ class TurnStreamState:
     """Snapshot for the UI thread."""
 
     enabled: bool = True
+    # When True with enabled, any Broca turn can own the popup and a newer
+    # start preempts the current one (`f` follow). When False, only the
+    # selected agent seeks (`t` selected).
+    follow_all: bool = False
     active: bool = False
     lingering: bool = False
     agent_name: str = ""
     run_id: str = ""
-    status: str = "idle"  # idle | seeking | streaming | linger | error
+    status: str = "idle"  # idle | seeking | streaming | linger | error | off
     text: str = ""
     query: str = ""  # triggering user message, shown while waiting / as header
     saw_waiting_query: bool = False  # True once waiting pane showed `> query`
@@ -853,6 +857,7 @@ class TurnStreamWorker:
             if not enabled:
                 self._stop_event.set()
                 self.state.enabled = False
+                self.state.follow_all = False
                 self.state.active = False
                 self.state.lingering = False
                 self.state.status = "off"
@@ -870,6 +875,7 @@ class TurnStreamWorker:
                 self._stop_event.clear()
                 self.state.enabled = True
                 if not was:
+                    self.state.follow_all = False
                     self.state.active = False
                     self.state.lingering = False
                     self.state.status = "idle"
@@ -885,17 +891,51 @@ class TurnStreamWorker:
         if thread is not None and thread.is_alive():
             thread.join(timeout=self.DISABLE_JOIN_S)
 
-    def toggle(self) -> bool:
+    def set_mode(self, mode: str) -> None:
+        """``off`` | ``selected`` | ``follow``. ``t`` and ``f`` map here."""
+        if mode == "off":
+            self.set_enabled(False)
+            return
+        if mode == "follow":
+            self.set_enabled(True)
+            with self._lock:
+                self.state.follow_all = True
+                if self.state.status == "off":
+                    self.state.status = "idle"
+            return
+        # selected
+        self.set_enabled(True)
         with self._lock:
-            new = not self.state.enabled
-        self.set_enabled(new)
-        return new
+            self.state.follow_all = False
+            if self.state.status == "off":
+                self.state.status = "idle"
+
+    def toggle(self) -> bool:
+        """``t`` — selected-agent turn stream. Turns follow off."""
+        with self._lock:
+            selected_on = self.state.enabled and not self.state.follow_all
+        if selected_on:
+            self.set_mode("off")
+            return False
+        self.set_mode("selected")
+        return True
+
+    def toggle_follow(self) -> bool:
+        """``f`` — any-agent turn stream with preempt. Turns selected mode off."""
+        with self._lock:
+            follow_on = self.state.enabled and self.state.follow_all
+        if follow_on:
+            self.set_mode("off")
+            return False
+        self.set_mode("follow")
+        return True
 
     def snapshot(self) -> TurnStreamState:
         with self._lock:
             s = self.state
             return TurnStreamState(
                 enabled=s.enabled,
+                follow_all=s.follow_all,
                 active=s.active,
                 lingering=s.lingering,
                 agent_name=s.agent_name,
@@ -918,11 +958,13 @@ class TurnStreamWorker:
         broca_by_agent: dict[str, str] | None = None,
         now: float | None = None,
     ) -> None:
-        """Observe Broca scrollbacks; seek only for the selected agent (#4069).
+        """Observe Broca scrollbacks and arm the turn popup.
 
-        ``broca_by_agent`` supplies independent cursors for every eligible Broca
-        window. Background turn starts become ``pending_agents`` badges and
-        never replace an in-progress focused turn.
+        Selected mode (``t``): seek only for the focused agent; other starts
+        become ``pending_agents`` badges and never replace an in-flight turn.
+
+        Follow mode (``f``): any agent can own the popup; a newer start
+        preempts the current stream.
         """
         now = now or time.time()
         self._selected_agent = selected_agent
@@ -934,9 +976,11 @@ class TurnStreamWorker:
 
         with self._lock:
             enabled = self.state.enabled
+            follow_all = self.state.follow_all
             lingering = self.state.lingering
             linger_until = self.state.linger_until
             status = self.state.status
+            current_agent = self.state.agent_name
 
         if not enabled:
             return
@@ -984,6 +1028,18 @@ class TurnStreamWorker:
             self._prev_scroll[name] = new
             if scrollback_signals_turn_start(prev, new, now=now):
                 started.append(name)
+
+        if follow_all:
+            self._tick_follow(
+                started=started,
+                busy=busy,
+                status=status,
+                current_agent=current_agent,
+                now=now,
+            )
+            return
+
+        # --- selected mode (t) below ---
 
         # A finished popup may still be on screen. The next real turn for
         # the agent you are watching has to replace it, or that turn is lost.
@@ -1052,6 +1108,100 @@ class TurnStreamWorker:
                 with self._lock:
                     self.state.pending_agents = list(self._pending_agents)
                 self._notify()
+
+    def _tick_follow(
+        self,
+        *,
+        started: list[str],
+        busy: bool,
+        status: str,
+        current_agent: str,
+        now: float,
+    ) -> None:
+        """Any-agent popup; a newer start drops the current turn."""
+        if not started:
+            if not busy:
+                # Idle follow still recovers an already-running selected turn.
+                if self._selected_agent:
+                    self._probe_current_turn(self._selected_agent, now=now)
+            return
+
+        # Prefer a start that is not the one already on screen; otherwise take
+        # the last detected (stable sort by agent name, then walk).
+        target = None
+        for name in started:
+            if name != current_agent:
+                target = name
+                break
+        if target is None:
+            target = started[-1]
+
+        if busy and status == "linger":
+            with self._lock:
+                self.state.lingering = False
+                self.state.active = False
+                self.state.status = "idle"
+                self.state.text = ""
+                self.state.query = ""
+                self.state.saw_waiting_query = False
+                self.state.error = ""
+                self.state.run_id = ""
+            busy = False
+
+        if busy:
+            # Preempt: drop the current stream and switch to the new start.
+            self._preempt_and_seek(
+                target, since=now, from_agent=current_agent or ""
+            )
+            return
+
+        self._begin_agent_seek(target, since=now)
+
+    def _begin_agent_seek(self, agent_name: str, *, since: float) -> None:
+        creds = load_agent_creds(self.agents_root, agent_name)
+        if creds is None:
+            with self._lock:
+                self.state.status = "error"
+                self.state.error = f"no Letta creds for {agent_name}"
+                self.state.active = True
+                self.state.agent_name = agent_name
+                self.state.linger_until = since + 8.0
+                self.state.lingering = True
+            self._notify()
+            return
+        self._start_seek(creds, since=since)
+
+    def _preempt_and_seek(
+        self, agent_name: str, *, since: float, from_agent: str = ""
+    ) -> None:
+        """Abort the in-flight turn and start seeking ``agent_name``."""
+        thread: threading.Thread | None = None
+        with self._lock:
+            self._generation += 1
+            self._stop_event.set()
+            self._followup_agent = None
+            self.state.active = False
+            self.state.lingering = False
+            self.state.status = "idle"
+            self.state.text = ""
+            self.state.query = ""
+            self.state.saw_waiting_query = False
+            self.state.error = ""
+            self.state.run_id = ""
+            self.state.agent_name = ""
+            self.state.pending_agents = []
+            self._pending_agents = []
+            thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=0.8)
+        self._stop_event.clear()
+        trace(
+            "turn",
+            "preempt",
+            from_agent=from_agent,
+            to_agent=agent_name,
+        )
+        self._begin_agent_seek(agent_name, since=since)
 
     def _probe_current_turn(self, agent_name: str, *, now: float) -> None:
         if now < self._probe_after:

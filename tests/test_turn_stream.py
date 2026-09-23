@@ -161,11 +161,127 @@ def test_load_agent_creds_from_parent_when_broca_has_no_letta_keys(tmp_path: Pat
 def test_worker_default_enabled_and_toggle(tmp_path: Path):
     w = TurnStreamWorker(agents_root=tmp_path)
     assert w.snapshot().enabled is True
+    assert w.snapshot().follow_all is False
     assert w.toggle() is False
     assert w.snapshot().enabled is False
     assert w.snapshot().status == "off"
     assert w.toggle() is True
     assert w.snapshot().enabled is True
+    assert w.snapshot().follow_all is False
+
+
+def test_follow_toggle_turns_off_selected_and_preempts(tmp_path: Path, monkeypatch):
+    """``f`` follows any agent; a newer start drops the current popup."""
+    from stop.turn_stream import TurnStreamWorker
+
+    root = tmp_path
+    for name in ("athena", "rico"):
+        d = root / name / "broca"
+        d.mkdir(parents=True)
+        (d / ".env").write_text(
+            f"AGENT_ID=agent-{name}\nAGENT_API_KEY=k\n"
+            "AGENT_ENDPOINT=http://127.0.0.1:9\n",
+            encoding="utf-8",
+        )
+
+    w = TurnStreamWorker(agents_root=root)
+    seeks: list[str] = []
+
+    def fake_start(creds, **kwargs):
+        seeks.append(creds.agent_name)
+        with w._lock:
+            w.state.active = True
+            w.state.status = "streaming"
+            w.state.agent_name = creds.agent_name
+            w.state.enabled = True
+
+    def fake_preempt(name, **kwargs):
+        seeks.append(f"preempt:{kwargs.get('from_agent', '')}->{name}")
+        with w._lock:
+            w.state.active = True
+            w.state.status = "streaming"
+            w.state.agent_name = name
+            w.state.enabled = True
+            w.state.follow_all = True
+
+    monkeypatch.setattr(w, "_start_seek", fake_start)
+    monkeypatch.setattr(w, "_preempt_and_seek", fake_preempt)
+
+    assert w.toggle_follow() is True
+    snap = w.snapshot()
+    assert snap.enabled is True
+    assert snap.follow_all is True
+
+    # t from follow → selected mode (follow off).
+    assert w.toggle() is True
+    assert w.snapshot().follow_all is False
+    assert w.snapshot().enabled is True
+    assert w.toggle_follow() is True
+    assert w.snapshot().follow_all is True
+
+    now = time.time()
+    w.tick(
+        selected_agent="ada",
+        broca_by_agent={"athena": _live(now)},
+        now=now,
+    )
+    assert seeks == ["athena"]
+
+    seeks.clear()
+    w.tick(
+        selected_agent="ada",
+        broca_by_agent={
+            "athena": _live(now) + "\nmore\n",
+            "rico": _live(now + 1),
+        },
+        now=now + 1,
+    )
+    assert seeks == ["preempt:athena->rico"]
+
+
+def test_selected_mode_does_not_preempt_for_background_agent(
+    tmp_path: Path, monkeypatch
+):
+    root = tmp_path
+    for name in ("athena", "rico"):
+        d = root / name / "broca"
+        d.mkdir(parents=True)
+        (d / ".env").write_text(
+            f"AGENT_ID=agent-{name}\nAGENT_API_KEY=k\n"
+            "AGENT_ENDPOINT=http://127.0.0.1:9\n",
+            encoding="utf-8",
+        )
+    w = TurnStreamWorker(agents_root=root)
+    w.set_mode("selected")
+    seeks: list[str] = []
+    monkeypatch.setattr(
+        w,
+        "_start_seek",
+        lambda creds, **k: seeks.append(creds.agent_name),
+    )
+    preempted = []
+    monkeypatch.setattr(
+        w,
+        "_preempt_and_seek",
+        lambda *a, **k: preempted.append(a),
+    )
+    now = time.time()
+    with w._lock:
+        w.state.active = True
+        w.state.status = "streaming"
+        w.state.agent_name = "athena"
+    w._prev_scroll["athena"] = _live(now - 30)
+    w.tick(
+        selected_agent="athena",
+        broca_by_agent={
+            "athena": _live(now - 30) + "\nstill going\n",
+            "rico": _live(now),
+        },
+        now=now,
+    )
+    assert preempted == []
+    assert "rico" in w.snapshot().pending_agents
+    assert seeks == []
 
 
 def test_worker_first_paint_fires_only_when_live_line_is_fresh(tmp_path: Path):

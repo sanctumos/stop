@@ -131,8 +131,10 @@ class HelpScreen(ModalScreen[None]):
             "Tab          cycle panes (narrow: page agents→windows→Active Now)\n"
             "a            jump to Active Now\n"
             "l            jump to Letta pane\n"
-            "t            toggle turn-stream overlay (default ON)\n"
-            "f            follow-lock / release Active Now\n"
+            "t            turn popup for the selected agent only (default ON)\n"
+            "f            follow: turn popup for any agent; newer turn preempts\n"
+            "             (enabling f turns t off, and vice versa)\n"
+            "p            pin / release Active Now on the current hottest window\n"
             "PgUp/PgDn    scroll focused log (holds follow-tail)\n"
             "Home/End     jump log start / resume follow-tail at end\n"
             "/            filter agents\n"
@@ -143,7 +145,8 @@ class HelpScreen(ModalScreen[None]):
             "Active Now follows human/agent dialogue — not otto_bridge chatter.\n"
             "Bottom row: Active Now (left) + Letta console (right).\n"
             "Turn stream: Broca turn-start → Letta /v1/runs/{id}/stream;\n"
-            "  step chunks (not per-token); pane follows the bottom; linger 60s; t toggles.\n"
+            "  step chunks (not per-token); pane follows the bottom; linger 60s.\n"
+            "  t = selected agent only; f = any agent (preempt). One of them on at a time.\n"
             "stop screen is never hardcopied into this TUI.\n"
             "Log lines with [brackets] are escaped (cannot crash UI).\n\n"
             "[dim]Esc / q / ? to close[/dim]",
@@ -438,9 +441,13 @@ class WindowPane(Vertical):
                 f"\n[error] {state.error}" if state.error else ""
             )
         nchars = len(body)
+        if state.follow_all:
+            toggle_hint = "f off"
+        else:
+            toggle_hint = "t off"
         _paint(
             meta,
-            f"[b]{mode}[/b]  [dim]{elapsed}{nchars} chars · follows end · t off[/dim]",
+            f"[b]{mode}[/b]  [dim]{elapsed}{nchars} chars · follows end · {toggle_hint}[/dim]",
         )
         lines = body.splitlines() or [body]
         if len(lines) > 350:
@@ -688,7 +695,8 @@ class StopApp(App[None]):
         Binding("a", "focus_active", "active"),
         Binding("l", "focus_letta", "letta"),
         Binding("t", "toggle_turn_stream", "turns"),
-        Binding("f", "toggle_follow", "follow"),
+        Binding("f", "toggle_turn_follow", "follow"),
+        Binding("p", "toggle_active_pin", "pin"),
         Binding("question_mark", "help", "help"),
         Binding("slash", "filter", "filter"),
         Binding("pageup", "log_page_up", "pgup", show=False),
@@ -992,6 +1000,10 @@ class StopApp(App[None]):
                 if self._turn is not None:
                     st = self._turn.snapshot()
                     bits: list[str] = []
+                    if st.enabled and st.follow_all:
+                        bits.append("follow")
+                    elif st.enabled:
+                        bits.append("turns")
                     if st.active and st.agent_name:
                         bits.append(f"turn:{st.agent_name}")
                     if st.pending_agents:
@@ -1048,11 +1060,33 @@ class StopApp(App[None]):
         if self._turn is None:
             return
         on = self._turn.toggle()
-        # Immediate UI feedback in the event strip.
         self.query_one(EventStrip).update(
-            f"events: turn-stream {'ON' if on else 'OFF'} (t to toggle)"
+            f"events: turn-stream {'ON (selected)' if on else 'OFF'} (t)"
         )
         self.query_one(WindowPane).show_turn(self._turn.snapshot())
+
+    def action_toggle_turn_follow(self) -> None:
+        if self._turn is None:
+            return
+        on = self._turn.toggle_follow()
+        self.query_one(EventStrip).update(
+            f"events: turn-follow {'ON (any agent, preempt)' if on else 'OFF'} (f)"
+        )
+        self.query_one(WindowPane).show_turn(self._turn.snapshot())
+
+    def action_toggle_active_pin(self) -> None:
+        """Pin Active Now on the current hottest window (was ``f``, now ``p``)."""
+        if self._snap is None:
+            return
+        if self.follow_lock_id is not None:
+            self.follow_lock_id = None
+        else:
+            active = pick_active_now(
+                self._snap.agents,
+                exclude_screens=frozenset(self.config.active_exclude),
+            )
+            self.follow_lock_id = active.id if active else None
+        self.refresh_host()
 
     def action_down(self) -> None:
         pane = self.query_one(WindowPane)
@@ -1236,19 +1270,6 @@ class StopApp(App[None]):
             return bool(log.is_vertical_scroll_end)
         except Exception:
             return True
-
-    def action_toggle_follow(self) -> None:
-        if self._snap is None:
-            return
-        if self.follow_lock_id is not None:
-            self.follow_lock_id = None
-        else:
-            active = pick_active_now(
-                self._snap.agents,
-                exclude_screens=frozenset(self.config.active_exclude),
-            )
-            self.follow_lock_id = active.id if active else None
-        self.refresh_host()
 
     def action_focus_active(self) -> None:
         if "narrow" in self.screen.classes:

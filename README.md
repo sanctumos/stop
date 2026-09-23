@@ -55,8 +55,9 @@ python3 -m venv .venv && .venv/bin/pip install -e .[dev]
 | `Enter` / `Esc` | Expand / collapse window pane |
 | `Tab` | Cycle panes (narrow: agents → windows → Active Now → Letta) |
 | `a` / `l` | Jump Active Now / Letta |
-| `t` | Toggle turn-stream overlay |
-| `f` | Follow-lock / release Active Now |
+| `t` | Turn popup for the **selected** agent only (default ON) |
+| `f` | **Follow** — turn popup for **any** agent; a newer turn drops the current one (turns `t` off) |
+| `p` | Pin / release Active Now on the current hottest window |
 | `PgUp` / `PgDn` | Scroll focused log (holds follow-tail) |
 | `Home` / `End` | Log start / resume follow-tail at end |
 | `/` | Filter agents |
