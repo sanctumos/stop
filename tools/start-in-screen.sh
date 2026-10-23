@@ -27,6 +27,32 @@ if ! flock -n 9; then
   exit 0
 fi
 
+# Scratch sweeper — runs even when the TUI session already exists.
+# Unique hardcopy temps are unlinked in the TUI; leftovers must not pile up.
+# crontab -l syslog-logs every LIST, so we refresh a disk cache at most every
+# five minutes instead of letting the TUI LIST on every tick.
+_STOP_TMP="${STOP_TMP:-/tmp/stop-$(id -u)}"
+mkdir -p "$_STOP_TMP"
+chmod 700 "$_STOP_TMP" 2>/dev/null || true
+find "$_STOP_TMP" -maxdepth 1 -type f -name '*.hc' -mmin +1 -delete 2>/dev/null || true
+find "$_STOP_TMP" -maxdepth 1 -type f -name '*.json.tmp' -mmin +1 -delete 2>/dev/null || true
+_CT="$_STOP_TMP/crontab.txt"
+_NEED_CRONTAB=1
+if [[ -f "$_CT" ]]; then
+  _CT_AGE=$(( $(date +%s) - $(stat -c %Y "$_CT" 2>/dev/null || echo 0) ))
+  if [[ "$_CT_AGE" -ge 0 && "$_CT_AGE" -lt 300 ]]; then
+    _NEED_CRONTAB=0
+  fi
+fi
+if [[ "$_NEED_CRONTAB" -eq 1 ]]; then
+  if crontab -l >"${_CT}.tmp" 2>/dev/null; then
+    chmod 600 "${_CT}.tmp" 2>/dev/null || true
+    mv "${_CT}.tmp" "$_CT"
+  else
+    rm -f "${_CT}.tmp"
+  fi
+fi
+
 _screen_ls() {
   screen -ls 2>&1 || true
 }

@@ -25,6 +25,7 @@ from .models import (
     WindowState,
 )
 from .parsers import parse_screen_list
+from .scratch import prune_scratch_dir
 from .state import is_failure
 
 # Keep memory bounded — full Letta/Broca hardcopies can be 100KB–MB each.
@@ -236,6 +237,14 @@ class LiveHost(HostBackend):
         # Bridge dir counts: cache so we do not iterdir every tick.
         self._bridge_count_cache: dict[str, tuple[float, int, int]] = {}
         self._bridge_count_interval_s = 4.0
+        # crontab -l syslog-logs every LIST. Prefer the on-disk copy under
+        # tmp (refreshed by start-in-screen.sh). Memory + mtime cache so a
+        # 1s UI tick never floods rsyslog/journald (moya 2026-10-23).
+        self._crontab_cache: str = ""
+        self._crontab_cache_epoch: float = 0.0
+        self._crontab_cache_interval_s = 300.0
+        self._scratch_prune_epoch: float = 0.0
+        self._scratch_prune_interval_s = 30.0
         # (epoch, bytes_sent, bytes_recv) for net rate
         self._prev_net: tuple[float, int, int] | None = None
         # Textual main-thread id when known — snapshot must not run there (#4061).
@@ -322,7 +331,26 @@ class LiveHost(HostBackend):
                 seen.add(name)
         return out, cursor
 
+    def _crontab_cache_path(self) -> Path:
+        return self.tmp / "crontab.txt"
+
     def _read_crontab(self) -> str:
+        now = time.monotonic()
+        if (
+            self._crontab_cache_epoch
+            and (now - self._crontab_cache_epoch) < self._crontab_cache_interval_s
+        ):
+            return self._crontab_cache
+        cache_path = self._crontab_cache_path()
+        try:
+            age = time.time() - cache_path.stat().st_mtime
+            if age < self._crontab_cache_interval_s:
+                text = cache_path.read_text(encoding="utf-8", errors="replace")
+                self._crontab_cache = text
+                self._crontab_cache_epoch = now
+                return text
+        except OSError:
+            pass
         try:
             r = subprocess.run(
                 ["crontab", "-l"],
@@ -331,9 +359,29 @@ class LiveHost(HostBackend):
                 timeout=5,
                 check=False,
             )
-            return r.stdout if r.returncode == 0 else ""
+            text = r.stdout if r.returncode == 0 else ""
         except (OSError, subprocess.TimeoutExpired):
-            return ""
+            text = ""
+        self._crontab_cache = text
+        self._crontab_cache_epoch = now
+        try:
+            self.tmp.mkdir(mode=0o700, exist_ok=True)
+            tmp = cache_path.with_suffix(".txt.tmp")
+            tmp.write_text(text, encoding="utf-8")
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, cache_path)
+        except OSError:
+            pass
+        return text
+
+    def _maybe_prune_scratch(self, now: float) -> None:
+        if (
+            self._scratch_prune_epoch
+            and (now - self._scratch_prune_epoch) < self._scratch_prune_interval_s
+        ):
+            return
+        prune_scratch_dir(self.tmp, now=now)
+        self._scratch_prune_epoch = now
 
     def _read_screen_list(self) -> str:
         try:
@@ -358,6 +406,7 @@ class LiveHost(HostBackend):
         now = time.time()
         do_hardcopy = (now - self._last_hardcopy_epoch) >= self.hardcopy_interval_s
         # Completion timestamp is set AFTER the batch — not before (#4062).
+        self._maybe_prune_scratch(now)
 
         crontab = self._read_crontab()
         screens = parse_screen_list(self._read_screen_list())

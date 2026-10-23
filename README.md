@@ -81,6 +81,9 @@ own directory; lock file defaults to `/tmp/stop-<uid>-screen-start.lock`.
 
 - Never writes into the agents tree; never sends screen commands other than
   `hardcopy`. Scratch lives in `/tmp/stop-<uid>/` (bounded metrics, errors, trace).
+  Leftover unique `*.hc` temps are swept (TUI every 30s; `start-in-screen.sh`
+  every minute). `crontab -l` is cached to `crontab.txt` for 5 minutes so the
+  TUI cannot LIST-flood syslog.
 - Architecture: three lanes (collection / state / render) — see
   [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). Widgets must not do host I/O.
 - Turn ask text uses published Otto bridge HTTP ``GET /v1/turn/current``

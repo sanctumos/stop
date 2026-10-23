@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 import urllib.request
@@ -14,7 +15,7 @@ import pytest
 from stop.host import sanitize_screen_name
 from stop.http_safe import HttpPolicyError, build_opener, validate_outbound_url
 from stop.metrics import StopMetrics, metrics_dir
-from stop.scratch import append_bounded
+from stop.scratch import append_bounded, prune_scratch_dir
 from stop.telemetry import TraceRing, _redact
 from stop.turn_stream import TurnStreamWorker
 
@@ -171,6 +172,52 @@ def test_append_bounded_trims(tmp_path: Path):
     p = tmp_path / "err.log"
     append_bounded(p, ("x" * 100 + "\n") * 50, max_bytes=800)
     assert p.stat().st_size <= 900
+
+
+def test_prune_scratch_dir_removes_stale_hc(tmp_path: Path):
+    keep = tmp_path / "crontab.txt"
+    keep.write_text("ok\n")
+    metrics = tmp_path / "metrics.jsonl"
+    metrics.write_text("{}\n")
+    stale = tmp_path / "broca-athena.1.hc"
+    stale.write_text("old")
+    fresh = tmp_path / "broca-ada.2.hc"
+    fresh.write_text("new")
+    tmp_atomic = tmp_path / "trace.json.tmp"
+    tmp_atomic.write_text("{}")
+    now = time.time()
+    os.utime(stale, (now - 120, now - 120))
+    os.utime(tmp_atomic, (now - 120, now - 120))
+    os.utime(fresh, (now, now))
+    n = prune_scratch_dir(tmp_path, now=now, hc_max_age_s=60)
+    assert n == 2
+    assert not stale.exists()
+    assert not tmp_atomic.exists()
+    assert fresh.exists()
+    assert keep.exists()
+    assert metrics.exists()
+
+
+def test_maybe_prune_scratch_throttled(tmp_path: Path):
+    from stop.host import LiveHost
+
+    host = LiveHost(home=tmp_path)
+    host.tmp = tmp_path / "stop-tmp"
+    host.tmp.mkdir()
+    host._scratch_prune_interval_s = 30.0
+    stale = host.tmp / "leftover.hc"
+    stale.write_text("x")
+    now = time.time()
+    os.utime(stale, (now - 120, now - 120))
+    host._maybe_prune_scratch(now)
+    assert not stale.exists()
+    # Recreate; second call inside the interval must not touch it.
+    stale.write_text("x")
+    os.utime(stale, (now - 120, now - 120))
+    host._maybe_prune_scratch(now + 5)
+    assert stale.exists()
+    host._maybe_prune_scratch(now + 31)
+    assert not stale.exists()
 
 
 def test_configure_classifiers_noise():
